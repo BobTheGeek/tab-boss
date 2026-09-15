@@ -101,6 +101,13 @@ test("an incognito source window is not cloned from", async () => {
   assert.equal(cloned, false);
 });
 
+test("a popup source window is not cloned from", async () => {
+  const { fake, state } = setupClonable();
+  fake.windows.get(1).type = "popup";
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(cloned, false);
+});
+
 test("the source is current when focus fired before creation", async () => {
   const { fake, state } = setupClonable();
   recordFocus(state, 2);
@@ -132,5 +139,23 @@ test("the suppression flag is cleared even when the clone throws", async () => {
     throw new Error("boom");
   };
   await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(state.suppressedWindowIds.has(2), false);
+});
+
+test("a window closing mid-clone is a silent race, not a logged failure", async () => {
+  const { fake, state } = setupClonable();
+  fake.api.tabs.create = async () => {
+    fake.windows.delete(2);
+    throw new Error("window closed");
+  };
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(warnings, []);
   assert.equal(state.suppressedWindowIds.has(2), false);
 });
