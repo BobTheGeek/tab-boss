@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createFakeChrome } from "./fakeChrome.js";
 import { createState, recordFocus } from "../src/state.js";
-import { cloneIntoWindow, isBlankTab } from "../src/windowCloning.js";
+import {
+  cloneIntoWindow,
+  isBlankTab,
+  isClonableUrl,
+} from "../src/windowCloning.js";
 
 test("isBlankTab recognises the blank URLs a new window can hold", () => {
   assert.equal(isBlankTab({ url: "" }), true);
@@ -158,4 +162,104 @@ test("a window closing mid-clone is a silent race, not a logged failure", async 
   }
   assert.deepEqual(warnings, []);
   assert.equal(state.suppressedWindowIds.has(2), false);
+});
+
+test("isClonableUrl rejects URLs an extension may not reopen", () => {
+  assert.equal(isClonableUrl("https://example.com/"), true);
+  assert.equal(isClonableUrl("http://example.com/"), true);
+  assert.equal(isClonableUrl("chrome://settings/"), false);
+  assert.equal(isClonableUrl("chrome-untrusted://foo/"), false);
+  assert.equal(isClonableUrl("devtools://devtools/"), false);
+  assert.equal(isClonableUrl("file:///Users/me/notes.txt"), false);
+  assert.equal(isClonableUrl("about:blank"), false);
+  assert.equal(isClonableUrl("ego://newtab/"), false);
+  assert.equal(isClonableUrl(""), false);
+  assert.equal(isClonableUrl(undefined), false);
+});
+
+function clonedTabs(fake, windowId) {
+  return [...fake.tabs.values()]
+    .filter((tab) => tab.windowId === windowId)
+    .sort((a, b) => a.index - b.index);
+}
+
+test("tabs are recreated in source order", async () => {
+  const { fake, state } = setupClonable();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.deepEqual(
+    clonedTabs(fake, 2).map((tab) => tab.url),
+    ["https://a.test/", "https://b.test/"],
+  );
+});
+
+test("the blank placeholder tab is removed", async () => {
+  const { fake, state } = setupClonable();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(fake.tabs.has(20), false);
+});
+
+test("pinned state is reproduced", async () => {
+  const { fake, state } = setupClonable();
+  fake.tabs.get(10).pinned = true;
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.deepEqual(
+    clonedTabs(fake, 2).map((tab) => tab.pinned),
+    [true, false],
+  );
+});
+
+test("muted state is reproduced", async () => {
+  const { fake, state } = setupClonable();
+  fake.tabs.get(10).mutedInfo = { muted: true };
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.deepEqual(
+    clonedTabs(fake, 2).map((tab) => tab.mutedInfo.muted),
+    [true, false],
+  );
+});
+
+test("the same tab ends up active", async () => {
+  const { fake, state } = setupClonable();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const active = clonedTabs(fake, 2).filter((tab) => tab.active);
+  assert.equal(active.length, 1);
+  assert.equal(active[0].url, "https://b.test/");
+});
+
+test("background tabs are unloaded but the active one is not", async () => {
+  const { fake, state } = setupClonable();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const byUrl = Object.fromEntries(
+    clonedTabs(fake, 2).map((tab) => [tab.url, tab.discarded]),
+  );
+  assert.equal(byUrl["https://a.test/"], true);
+  assert.equal(byUrl["https://b.test/"], false);
+});
+
+test("unclonable tabs are skipped and the rest still clone", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "chrome://settings/" },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.deepEqual(
+    clonedTabs(fake, 2).map((tab) => tab.url),
+    ["https://b.test/"],
+  );
+});
+
+test("a refused discard does not stop the clone", async () => {
+  const { fake, state } = setupClonable();
+  fake.api.tabs.discard = async () => {
+    throw new Error("cannot discard");
+  };
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(clonedTabs(fake, 2).length, 2);
+  assert.equal(fake.tabs.has(20), false);
 });

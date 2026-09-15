@@ -38,9 +38,84 @@ async function windowStillOpen(api, windowId) {
   }
 }
 
+/** Schemes Chromium forbids an extension from opening in a new tab. */
+const UNCLONABLE_PREFIXES = [
+  "about:",
+  "chrome://",
+  "chrome-untrusted://",
+  "devtools://",
+  "edge://",
+  "ego://",
+  "file://",
+  "view-source:",
+];
+
+export function isClonableUrl(url) {
+  if (!url) return false;
+  return !UNCLONABLE_PREFIXES.some((prefix) => url.startsWith(prefix));
+}
+
+/** Runs a best-effort browser call whose failure must not stop the clone. */
+async function ignoreFailure(promise) {
+  try {
+    await promise;
+  } catch {
+    // Best effort only.
+  }
+}
+
+/**
+ * Recreates the source window's tabs in the target window.
+ *
+ * Ordering matters: tabs are created, then muted, then the right one is
+ * activated, and only then are the rest unloaded. Discarding before activating
+ * would fight the browser, which refuses to discard the active tab.
+ */
 async function copyTabs(api, sourceId, targetId) {
-  // Replaced in Task 5.
-  await api.tabs.create({ windowId: targetId, url: "about:blank" });
+  const sourceTabs = (await api.tabs.query({ windowId: sourceId })).sort(
+    (a, b) => a.index - b.index,
+  );
+
+  const pairs = [];
+  let skipped = 0;
+
+  for (const source of sourceTabs) {
+    if (!isClonableUrl(source.url)) {
+      skipped += 1;
+      continue;
+    }
+    const clone = await api.tabs.create({
+      windowId: targetId,
+      url: source.url,
+      pinned: source.pinned,
+      active: false,
+    });
+    pairs.push({ source, clone });
+  }
+
+  if (skipped > 0) {
+    console.warn(
+      `[Tab Boss] skipped ${skipped} tab(s) the browser will not let an extension reopen`,
+    );
+  }
+
+  for (const { source, clone } of pairs) {
+    if (source.mutedInfo?.muted) {
+      await ignoreFailure(api.tabs.update(clone.id, { muted: true }));
+    }
+  }
+
+  const activePair = pairs.find(({ source }) => source.active);
+  if (activePair) {
+    await ignoreFailure(api.tabs.update(activePair.clone.id, { active: true }));
+  }
+
+  for (const { clone } of pairs) {
+    if (clone.id === activePair?.clone.id) continue;
+    await ignoreFailure(api.tabs.discard(clone.id));
+  }
+
+  return pairs;
 }
 
 /**
