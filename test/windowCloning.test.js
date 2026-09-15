@@ -263,3 +263,84 @@ test("a refused discard does not stop the clone", async () => {
   assert.equal(clonedTabs(fake, 2).length, 2);
   assert.equal(fake.tabs.has(20), false);
 });
+
+/** Window 1 holds two grouped tabs plus one loose tab. */
+function setupGrouped(groupOverrides = {}) {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    groups: [
+      {
+        id: 77,
+        windowId: 1,
+        title: "Research",
+        color: "blue",
+        ...groupOverrides,
+      },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://a.test/", groupId: 77 },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", groupId: 77 },
+      { id: 12, windowId: 1, index: 2, url: "https://c.test/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+  return { fake, state };
+}
+
+test("grouped tabs land in one new group in the new window", async () => {
+  const { fake, state } = setupGrouped();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const cloned = clonedTabs(fake, 2);
+  const groupIds = cloned.map((tab) => tab.groupId);
+  assert.equal(groupIds[0], groupIds[1]);
+  assert.notEqual(groupIds[0], -1);
+  assert.equal(groupIds[2], -1);
+});
+
+test("the new group keeps the source title and colour", async () => {
+  const { fake, state } = setupGrouped();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const newGroupId = clonedTabs(fake, 2)[0].groupId;
+  const group = fake.groups.get(newGroupId);
+  assert.equal(group.title, "Research");
+  assert.equal(group.color, "blue");
+  assert.equal(group.windowId, 2);
+});
+
+test("a collapsed source group is recreated collapsed", async () => {
+  const { fake, state } = setupGrouped({ collapsed: true });
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const newGroupId = clonedTabs(fake, 2)[0].groupId;
+  assert.equal(fake.groups.get(newGroupId).collapsed, true);
+});
+
+test("collapse is applied after activation so the browser can refuse it", async () => {
+  const { fake, state } = setupGrouped({ collapsed: true });
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const names = fake.calls.map(([name, ...args]) =>
+    name === "tabs.update" && args[1]?.active ? "activate" : name,
+  );
+  const collapseIndex = fake.calls.findIndex(
+    ([name, , props]) => name === "tabGroups.update" && props?.collapsed,
+  );
+  assert.ok(collapseIndex > names.indexOf("activate"));
+});
+
+test("a group that disappears mid-clone does not stop the clone", async () => {
+  const { fake, state } = setupGrouped();
+  fake.groups.delete(77);
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(clonedTabs(fake, 2).length, 3);
+  assert.equal(fake.tabs.has(20), false);
+});
+
+test("ungrouped tabs never trigger a group call", async () => {
+  const { fake, state } = setupClonable();
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "tabs.group"),
+    [],
+  );
+});

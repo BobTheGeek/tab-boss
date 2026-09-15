@@ -1,4 +1,4 @@
-import { resolveSourceWindowId } from "./state.js";
+import { TAB_GROUP_ID_NONE, resolveSourceWindowId } from "./state.js";
 
 /** Exact URLs a brand new empty window may show. */
 export const BLANK_TAB_URLS = ["", "about:blank"];
@@ -65,6 +65,46 @@ async function ignoreFailure(promise) {
 }
 
 /**
+ * Rebuilds each source group in the target window.
+ *
+ * Collapsed state is NOT applied here. Chromium refuses to collapse a group
+ * holding the active tab, so the caller applies it after activation and lets
+ * the browser refuse where it must.
+ *
+ * Returns Array<{ newGroupId, collapsed }>.
+ */
+async function recreateGroups(api, targetId, pairs) {
+  const cloneIdsBySourceGroup = new Map();
+  for (const { source, clone } of pairs) {
+    const groupId = source.groupId;
+    if (groupId == null || groupId === TAB_GROUP_ID_NONE) continue;
+    if (!cloneIdsBySourceGroup.has(groupId)) {
+      cloneIdsBySourceGroup.set(groupId, []);
+    }
+    cloneIdsBySourceGroup.get(groupId).push(clone.id);
+  }
+
+  const created = [];
+  for (const [sourceGroupId, tabIds] of cloneIdsBySourceGroup) {
+    try {
+      const sourceGroup = await api.tabGroups.get(sourceGroupId);
+      const newGroupId = await api.tabs.group({
+        tabIds,
+        createProperties: { windowId: targetId },
+      });
+      await api.tabGroups.update(newGroupId, {
+        title: sourceGroup.title,
+        color: sourceGroup.color,
+      });
+      created.push({ newGroupId, collapsed: sourceGroup.collapsed });
+    } catch (error) {
+      console.warn("[Tab Boss] could not recreate a tab group", error);
+    }
+  }
+  return created;
+}
+
+/**
  * Recreates the source window's tabs in the target window.
  *
  * Ordering matters: tabs are created, then muted, then the right one is
@@ -105,9 +145,16 @@ async function copyTabs(api, sourceId, targetId) {
     }
   }
 
+  const groups = await recreateGroups(api, targetId, pairs);
+
   const activePair = pairs.find(({ source }) => source.active);
   if (activePair) {
     await ignoreFailure(api.tabs.update(activePair.clone.id, { active: true }));
+  }
+
+  for (const { newGroupId, collapsed } of groups) {
+    if (!collapsed) continue;
+    await ignoreFailure(api.tabGroups.update(newGroupId, { collapsed: true }));
   }
 
   for (const { clone } of pairs) {
