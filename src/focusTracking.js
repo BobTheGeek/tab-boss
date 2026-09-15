@@ -11,13 +11,15 @@ function isCloneSource(win) {
 export function installFocusTracking(api, state) {
   api.windows.onFocusChanged.addListener(async (windowId) => {
     if (windowId == null || windowId === WINDOW_ID_NONE) return;
+    let win;
     try {
-      const win = await api.windows.get(windowId);
-      if (!isCloneSource(win)) return;
-      recordFocus(state, windowId);
+      win = await api.windows.get(windowId);
     } catch {
       // The window closed between the event and the lookup.
+      return;
     }
+    if (!isCloneSource(win)) return;
+    recordFocus(state, windowId);
   });
 }
 
@@ -26,11 +28,13 @@ export function installFocusTracking(api, state) {
  * Cmd+N after a worker eviction still has a source to clone from.
  */
 export async function seedFocus(api, state) {
+  let win;
   try {
-    const win = await api.windows.getLastFocused();
-    if (!isCloneSource(win)) return;
-    recordFocus(state, win.id);
+    win = await api.windows.getLastFocused();
   } catch {
     // No windows open yet.
+    return;
   }
+  if (!isCloneSource(win)) return;
+  recordFocus(state, win.id);
 }

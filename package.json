@@ -5,6 +5,6 @@
   "type": "module",
   "description": "New tabs go to the bottom. New windows clone the window you came from.",
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test \"test/**/*.test.js\""
   }
 }
