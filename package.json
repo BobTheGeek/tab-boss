@@ -1,0 +1,10 @@
+{
+  "name": "tab-boss",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "New tabs go to the bottom. New windows clone the window you came from.",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  }
+}
