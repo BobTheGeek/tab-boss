@@ -20,6 +20,37 @@ function createEvent() {
   };
 }
 
+/**
+ * A clock the test drives by hand, for code that waits before deciding.
+ *
+ * `now` and `wait` are shaped to be passed straight into an installer as
+ * injected dependencies, so nothing under test ever calls Date.now or
+ * setTimeout. `advance` is deliberately synchronous: it only resolves the
+ * timers that have come due. The caller then awaits whatever handle the code
+ * under test offers — which is a far more reliable way to know the work has
+ * finished than flushing an unknown number of microtask turns.
+ */
+export function createManualClock(startAt = 1_700_000_000_000) {
+  let current = startAt;
+  let pending = [];
+  return {
+    now: () => current,
+    wait(ms) {
+      return new Promise((resolve) => {
+        pending.push({ at: current + ms, resolve });
+      });
+    },
+    advance(ms) {
+      current += ms;
+      const due = pending
+        .filter((timer) => timer.at <= current)
+        .sort((a, b) => a.at - b.at);
+      pending = pending.filter((timer) => timer.at > current);
+      for (const timer of due) timer.resolve();
+    },
+  };
+}
+
 const WINDOW_DEFAULTS = { type: "normal", incognito: false };
 const TAB_DEFAULTS = {
   pinned: false,

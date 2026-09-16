@@ -4,6 +4,7 @@ import { installNewTabPlacement } from "./newTabPlacement.js";
 import { installRestore } from "./restore.js";
 import { installSnapshotScheduler } from "./snapshotScheduler.js";
 import { installWindowCloning } from "./windowCloning.js";
+import { installWindowObserver } from "./windowObserver.js";
 
 /**
  * TEMPORARY KILL SWITCH — see tb-dup.
@@ -35,50 +36,6 @@ import { installWindowCloning } from "./windowCloning.js";
  */
 const TAB_WRITING_ENABLED = false;
 
-/**
- * Diagnostic for tb-dup. Logs what every newly created window actually looks
- * like, and what the cloner WOULD have done, without writing anything.
- *
- * This exists because the gate and the failure disagree about the window's
- * type, and no fake can tell us what ego lite really reports. Remove it once
- * tb-dup is understood.
- */
-function installWindowDiagnostic(api) {
-  api.windows.onCreated.addListener(async (win) => {
-    try {
-      const tabs = await api.tabs.query({ windowId: win.id });
-      const now = await api.windows.get(win.id);
-      console.log(
-        "[Tab Boss dx] window created",
-        JSON.stringify({
-          id: win.id,
-          typeAtCreate: win.type,
-          typeNow: now.type,
-          incognito: win.incognito,
-          state: now.state,
-          tabCount: tabs.length,
-          urls: tabs.map((t) => t.url || t.pendingUrl || "").slice(0, 5),
-        }),
-      );
-    } catch (error) {
-      console.log("[Tab Boss dx] window vanished before inspection", error);
-    }
-  });
-
-  api.windows.onFocusChanged.addListener(async (windowId) => {
-    if (windowId == null || windowId < 0) return;
-    try {
-      const win = await api.windows.get(windowId);
-      console.log(
-        "[Tab Boss dx] focus",
-        JSON.stringify({ id: win.id, type: win.type }),
-      );
-    } catch {
-      // Window closed between the event and the lookup.
-    }
-  });
-}
-
 const state = createState();
 
 // Manifest V3 requires listeners to register synchronously at the top level,
@@ -91,7 +48,13 @@ if (TAB_WRITING_ENABLED) {
   installRestore(chrome, state);
 }
 
-installWindowDiagnostic(chrome);
+// Outside the kill switch on purpose. The window observer is the instrument
+// that has to run WHILE writing is off: it decides what the cloner would have
+// done with each new window and writes that verdict to its own storage key,
+// and it is the only thing that can tell us whether the ego lite Spaces
+// hypothesis for tb-l56 is right. It replaces the ad-hoc diagnostic that used
+// to live in this file. It never writes a tab or a window.
+installWindowObserver(chrome);
 
 // The scheduler takes the shared state so a capture can refuse while a restore
 // is halfway through building windows. It only ever reads tabs, so it stays on.
