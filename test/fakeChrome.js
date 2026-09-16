@@ -34,6 +34,7 @@ export function createFakeChrome(initial = {}) {
   const windows = new Map();
   const tabs = new Map();
   const groups = new Map();
+  const storage = new Map();
   const calls = [];
   let nextTabId = 1000;
   let nextGroupId = 500;
@@ -173,7 +174,27 @@ export function createFakeChrome(initial = {}) {
         return { ...win };
       },
     },
+
+    storage: {
+      local: {
+        async get(keys) {
+          calls.push(["storage.local.get", keys]);
+          const wanted = Array.isArray(keys) ? keys : [keys];
+          const out = {};
+          for (const key of wanted) {
+            if (storage.has(key)) out[key] = structuredClone(storage.get(key));
+          }
+          return out;
+        },
+        async set(items) {
+          calls.push(["storage.local.set", items]);
+          for (const [key, value] of Object.entries(items)) {
+            storage.set(key, structuredClone(value));
+          }
+        },
+      },
+    },
   };
 
-  return { api, calls, tabs, windows, groups };
+  return { api, calls, tabs, windows, groups, storage };
 }
