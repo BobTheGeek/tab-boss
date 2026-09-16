@@ -75,9 +75,14 @@ async function ignoreFailure(promise) {
  * holding the active tab, so the caller applies it after activation and lets
  * the browser refuse where it must.
  *
+ * `isAborted()` reports that the target window has been closed. It is checked
+ * before every call because a call into a destroyed window's tab strip is not
+ * merely useless: it can trip a CHECK in the browser process and take the
+ * whole browser down with it.
+ *
  * Returns Array<{ newGroupId, collapsed }>.
  */
-async function recreateGroups(api, targetId, pairs) {
+async function recreateGroups(api, targetId, pairs, isAborted) {
   const cloneIdsBySourceGroup = new Map();
   for (const { source, clone } of pairs) {
     const groupId = source.groupId;
@@ -90,12 +95,15 @@ async function recreateGroups(api, targetId, pairs) {
 
   const created = [];
   for (const [sourceGroupId, tabIds] of cloneIdsBySourceGroup) {
+    if (isAborted()) return created;
     try {
       const sourceGroup = await api.tabGroups.get(sourceGroupId);
+      if (isAborted()) return created;
       const newGroupId = await api.tabs.group({
         tabIds,
         createProperties: { windowId: targetId },
       });
+      if (isAborted()) return created;
       await api.tabGroups.update(newGroupId, {
         title: sourceGroup.title,
         color: sourceGroup.color,
@@ -114,8 +122,16 @@ async function recreateGroups(api, targetId, pairs) {
  * Ordering matters: tabs are created, then muted, then the right one is
  * activated, and only then are the rest unloaded. Discarding before activating
  * would fight the browser, which refuses to discard the active tab.
+ *
+ * This is five to twenty sequential calls into one window, and the user may
+ * close that window at any await. `isAborted()` says the window has gone; it
+ * is checked before every single call, and the copy then unwinds immediately
+ * and silently with whatever pairs it had built. Swallowing the failures
+ * instead — as `ignoreFailure` does for a one-off refusal — would keep firing
+ * calls at a destroyed window, which is what crashed the browser.
  */
-async function copyTabs(api, sourceId, targetId) {
+async function copyTabs(api, sourceId, targetId, isAborted) {
+  if (isAborted()) return [];
   const sourceTabs = (await api.tabs.query({ windowId: sourceId })).sort(
     (a, b) => a.index - b.index,
   );
@@ -124,6 +140,7 @@ async function copyTabs(api, sourceId, targetId) {
   let skipped = 0;
 
   for (const source of sourceTabs) {
+    if (isAborted()) return pairs;
     // A tab whose navigation has not committed reports an empty url and
     // carries its destination in pendingUrl, exactly as isBlankTab assumes.
     const url = source.url || source.pendingUrl || "";
@@ -148,25 +165,28 @@ async function copyTabs(api, sourceId, targetId) {
   }
 
   for (const { source, clone } of pairs) {
-    if (source.mutedInfo?.muted) {
-      await ignoreFailure(api.tabs.update(clone.id, { muted: true }));
-    }
+    if (!source.mutedInfo?.muted) continue;
+    if (isAborted()) return pairs;
+    await ignoreFailure(api.tabs.update(clone.id, { muted: true }));
   }
 
-  const groups = await recreateGroups(api, targetId, pairs);
+  const groups = await recreateGroups(api, targetId, pairs, isAborted);
 
   const activePair = pairs.find(({ source }) => source.active);
   if (activePair) {
+    if (isAborted()) return pairs;
     await ignoreFailure(api.tabs.update(activePair.clone.id, { active: true }));
   }
 
   for (const { newGroupId, collapsed } of groups) {
     if (!collapsed) continue;
+    if (isAborted()) return pairs;
     await ignoreFailure(api.tabGroups.update(newGroupId, { collapsed: true }));
   }
 
   for (const { clone } of pairs) {
     if (clone.id === activePair?.clone.id) continue;
+    if (isAborted()) return pairs;
     await ignoreFailure(api.tabs.discard(clone.id));
   }
 
@@ -210,8 +230,13 @@ export async function cloneIntoWindow(api, state, newWindow) {
   if (!isCloneSource(source)) return false;
 
   state.suppressedWindowIds.add(newWindow.id);
+  // windows.onRemoved marks this id the moment the user closes the window.
+  const isAborted = () => state.abortedWindowIds.has(newWindow.id);
   try {
-    const pairs = await copyTabs(api, source.id, newWindow.id);
+    const pairs = await copyTabs(api, source.id, newWindow.id, isAborted);
+    // The placeholder belongs to a window that no longer exists, so there is
+    // nothing to tidy up and nothing safe to call.
+    if (isAborted()) return false;
     // Removing a window's last tab closes the window. If every source tab was
     // unclonable there is nothing to replace the placeholder with, so leave a
     // plain empty window rather than making the new window vanish.
@@ -221,22 +246,36 @@ export async function cloneIntoWindow(api, state, newWindow) {
   } catch (error) {
     // The user can close the new window mid-clone, which fails every pending
     // call. That is an expected race and stays silent. Anything else is a real
-    // failure and must be findable in the service worker console.
-    if (await windowStillOpen(api, newWindow.id)) {
+    // failure and must be findable in the service worker console. When the
+    // removal event already told us the window is gone, we know it is the race
+    // without asking the browser again.
+    if (!isAborted() && (await windowStillOpen(api, newWindow.id))) {
       console.warn("[Tab Boss] clone failed", error);
     }
     return false;
   } finally {
     state.suppressedWindowIds.delete(newWindow.id);
+    state.abortedWindowIds.delete(newWindow.id);
   }
   return true;
 }
 
 export function installWindowCloning(api, state) {
+  // Manifest V3 will not wake an evicted service worker for a listener that
+  // was registered inside an awaited callback, so both registrations stay
+  // synchronous at the top level of the installer.
   api.windows.onCreated.addListener(
     async (win) => {
       await cloneIntoWindow(api, state, win);
     },
     { windowTypes: ["normal"] },
   );
+
+  api.windows.onRemoved.addListener((windowId) => {
+    // Only in-flight clone targets are recorded. Remembering every window the
+    // user ever closed would leak for the life of the service worker, and the
+    // clone clears its own id as it unwinds.
+    if (!state.suppressedWindowIds.has(windowId)) return;
+    state.abortedWindowIds.add(windowId);
+  });
 }

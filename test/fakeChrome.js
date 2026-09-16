@@ -157,6 +157,7 @@ export function createFakeChrome(initial = {}) {
     windows: {
       onCreated: createEvent(),
       onFocusChanged: createEvent(),
+      onRemoved: createEvent(),
 
       async get(windowId) {
         calls.push(["windows.get", windowId]);
