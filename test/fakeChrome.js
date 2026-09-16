@@ -34,9 +34,14 @@ export function createFakeChrome(initial = {}) {
   const windows = new Map();
   const tabs = new Map();
   const groups = new Map();
+  const storage = new Map();
+  const session = new Map();
+  const alarms = new Map();
   const calls = [];
+  const badge = { text: "" };
   let nextTabId = 1000;
   let nextGroupId = 500;
+  let nextWindowId = 50;
 
   for (const win of initial.windows ?? []) {
     windows.set(win.id, { ...WINDOW_DEFAULTS, ...win });
@@ -56,6 +61,31 @@ export function createFakeChrome(initial = {}) {
     const tab = tabs.get(tabId);
     if (!tab) throw new Error(`No tab with id ${tabId}`);
     return tab;
+  }
+
+  /** One chrome.storage area. `name` keeps the recorded call names exact. */
+  function createStorageArea(name, backing) {
+    return {
+      async get(keys) {
+        calls.push([`storage.${name}.get`, keys]);
+        const wanted = Array.isArray(keys) ? keys : [keys];
+        const out = {};
+        for (const key of wanted) {
+          if (backing.has(key)) out[key] = structuredClone(backing.get(key));
+        }
+        return out;
+      },
+      async set(items) {
+        calls.push([`storage.${name}.set`, items]);
+        for (const [key, value] of Object.entries(items)) {
+          backing.set(key, structuredClone(value));
+        }
+      },
+      async clear() {
+        calls.push([`storage.${name}.clear`]);
+        backing.clear();
+      },
+    };
   }
 
   const api = {
@@ -152,6 +182,13 @@ export function createFakeChrome(initial = {}) {
         Object.assign(group, props);
         return { ...group };
       },
+
+      async query({ windowId }) {
+        calls.push(["tabGroups.query", windowId]);
+        return [...groups.values()]
+          .filter((group) => group.windowId === windowId)
+          .map((group) => ({ ...group }));
+      },
     },
 
     windows: {
@@ -172,8 +209,76 @@ export function createFakeChrome(initial = {}) {
         if (!win) throw new Error("No open windows");
         return { ...win };
       },
+
+      async getAll() {
+        calls.push(["windows.getAll"]);
+        return [...windows.values()].map((win) => ({ ...win }));
+      },
+
+      async create(createData = {}) {
+        calls.push(["windows.create", createData]);
+        const id = nextWindowId++;
+        windows.set(id, { ...WINDOW_DEFAULTS, id, ...createData });
+        const tabId = nextTabId++;
+        tabs.set(tabId, {
+          ...TAB_DEFAULTS,
+          id: tabId,
+          windowId: id,
+          index: 0,
+          url: "about:blank",
+          active: true,
+        });
+        const created = { ...windows.get(id) };
+        // Chromium announces a new window before the create call resolves, so
+        // a listener can see it BEFORE the caller learns its id. Restoring
+        // depends on that being true here: suppressedWindowIds cannot cover a
+        // window whose id nobody knows yet, which is the whole reason
+        // state.restoreInProgress exists. A fake that only emitted after
+        // returning would make that guard untestable.
+        await api.windows.onCreated.emit(created);
+        await api.windows.onFocusChanged.emit(id);
+        return created;
+      },
+    },
+
+    action: {
+      onClicked: createEvent(),
+      async setBadgeText(details) {
+        calls.push(["action.setBadgeText", details]);
+        badge.text = details.text;
+      },
+    },
+
+    alarms: {
+      onAlarm: createEvent(),
+      async create(name, info) {
+        calls.push(["alarms.create", name, info]);
+        // Chromium cancels and replaces a same-name alarm rather than leaving
+        // the existing one alone, and re-derives its first fire time. Set is
+        // the right model: the new schedule wins.
+        alarms.set(name, info);
+      },
+      async get(name) {
+        calls.push(["alarms.get", name]);
+        // chrome.alarms.get resolves with undefined for an unknown name.
+        return alarms.has(name) ? { name, ...alarms.get(name) } : undefined;
+      },
+    },
+
+    runtime: {
+      onStartup: createEvent(),
+      onInstalled: createEvent(),
+    },
+
+    storage: {
+      local: createStorageArea("local", storage),
+      // A separate backing map, because the real areas have different
+      // lifetimes: the browser clears session storage on shutdown and keeps
+      // local across restarts. A test simulates a browser restart by clearing
+      // the session map and leaving the local one alone.
+      session: createStorageArea("session", session),
     },
   };
 
-  return { api, calls, tabs, windows, groups };
+  return { api, calls, tabs, windows, groups, storage, session, alarms, badge };
 }

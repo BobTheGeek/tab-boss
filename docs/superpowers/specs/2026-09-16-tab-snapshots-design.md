@@ -94,7 +94,35 @@ the same limitation the window cloner documents.
 
 - `snapshots` — an array, oldest first, capped at **20** entries. At 2-minute
   intervals that is roughly 40 minutes of history.
-- `meta` — `{ browserStartedAt: number, consecutiveSuspectedLosses: number }`.
+- `meta` — `{ browserStartedAt: number }`.
+
+And one key in `chrome.storage.session`:
+
+- `consecutiveSuspectedLosses` — a number.
+
+**The counter is in session storage deliberately, and it is load-bearing.** The
+browser clears session storage on shutdown, so the counter cannot survive a
+browser restart no matter what the extension does. That makes the reset a
+property of the storage area rather than of an event we would otherwise have to
+win a race against — see "Known gap, now closed" below. Session storage
+survives service worker eviction, so the count still accumulates correctly
+across the two-minute ticks within one session, which is exactly what the
+three-strike escape hatch needs. It needs no new permission: the existing
+`storage` permission covers both areas.
+
+A counter meaning "how many consecutive times *this session* have I seen a
+suspected loss" is semantically a session value. It was only ever in `meta`
+because an earlier draft put it there, and that is what caused the defect below.
+
+**`browserStartedAt` deliberately stays in `chrome.storage.local`.** In session
+storage, "absent" would be ambiguous between "fresh session" and "`onStartup`
+has not run yet", and the quiet period would be back to guessing. Local storage
+keeps the two states distinguishable.
+
+Because the counter has moved out, `meta` now has exactly one field and exactly
+one writer — `recordStart`. The read-modify-write clobber that the two
+overlapping writers used to create is therefore closed by construction, not
+merely narrowed.
 
 The whole `snapshots` array is rewritten on each save. At 20 snapshots of a few
 hundred tabs this is well under `chrome.storage.local`'s 10 MB quota and the
@@ -112,14 +140,56 @@ A `chrome.alarms` alarm named `tab-boss-snapshot` with
 Manifest V3 evicts the service worker when idle and a timer dies with it; an
 alarm wakes the worker back up.
 
-`chrome.alarms.create` is idempotent for a given name, so the alarm is created
-unconditionally at the top level of the service worker. No separate
-`onInstalled` / `onStartup` creation path is needed.
+**Correction.** An earlier draft of this spec claimed `chrome.alarms.create` is
+idempotent for a given name and that the alarm could therefore be created
+unconditionally at the top level of the service worker. That is wrong, and it
+would have stopped the feature working at all.
+
+Chromium's documentation says the opposite: "If there is another alarm with the
+same name (or no name if none is specified), it will be cancelled and replaced
+by this alarm." It also says that when only `periodInMinutes` is set,
+"`periodInMinutes` is used as the default for `delayInMinutes`" — so every
+`create` call schedules the first fire at now + 2 minutes.
+
+The service worker installer runs on every cold start, and Manifest V3 evicts
+the worker after roughly 30 seconds idle. Tab Boss listens for
+`tabs.onCreated`, `windows.onCreated`, `windows.onFocusChanged` and
+`windows.onRemoved`, so ordinary intermittent browsing cold-starts it
+constantly. Creating unconditionally would reset the alarm's clock each time
+and it would never reach two minutes: no snapshots, no error, no log, and an
+empty store the user only discovers when they need it.
+
+So the alarm is created **only when `chrome.alarms.get` reports none**:
+
+```js
+if (!(await api.alarms.get(SNAPSHOT_ALARM))) {
+  await api.alarms.create(SNAPSHOT_ALARM, {
+    periodInMinutes: SNAPSHOT_PERIOD_MINUTES,
+    persistAcrossSessions: true,
+  });
+}
+```
+
+Listener registration stays synchronous and above that check, because Manifest
+V3 will not wake an evicted worker for a listener registered inside an awaited
+callback. `persistAcrossSessions` is set explicitly rather than left to
+Chromium's `true` default, so the alarm survives a browser restart on any
+browser. No separate `onInstalled` / `onStartup` creation path is needed.
 
 ## Refusing to save
 
 Three rules, evaluated in this order. Any rule that fires skips the save
 entirely — nothing is written and nothing is pruned.
+
+Ahead of all three sits a guard rather than a rule: a capture refuses outright
+while `state.restoreInProgress` is set, returning `"restoring"`. Mid-restore the
+browser holds a remnant plus a part-built window, and storing that would make it
+the newest snapshot — so a click within the next two minutes would restore the
+half-finished restore. The next tick self-heals, but a several-hundred-tab
+restore runs longer than the two-minute period, which turns a possibility into a
+certainty. The flag is checked at the top of the capture and again immediately
+before the write, with no `await` in the gap, because the first check cannot see
+a toolbar click that landed while the windows were being read.
 
 When there is no stored snapshot yet, rules 2 and 3 do not apply — they both
 compare against a previous snapshot that does not exist. Only the quiet period
@@ -127,8 +197,40 @@ can block the very first save.
 
 ### 1. Quiet period
 
-`chrome.runtime.onStartup` writes `meta.browserStartedAt = Date.now()`.
-A save is skipped while `Date.now() - meta.browserStartedAt < 60_000`.
+`chrome.runtime.onStartup` writes `meta.browserStartedAt = Date.now()`. A save
+is skipped while `Date.now() - meta.browserStartedAt < 60_000`.
+
+It does **not** reset the suspected-loss counter. There is no need: the counter
+lives in `chrome.storage.session`, which the browser has already cleared by the
+time `onStartup` runs. Resetting it here as well would be a second mechanism for
+the same thing, and a strictly worse one — see below.
+
+**Known gap, now closed.** An earlier version of this fix reset the counter from
+`recordStart`. That only worked if `onStartup` won a race it does not always
+win: a persisted overdue alarm can fire *first*, and a capture at that moment
+read the previous session's counter *and* the previous session's
+`browserStartedAt`. The quiet period was bypassed, the counter was already at 2,
+so the escape hatch fired on the very first capture of the new session and a
+one-tab post-crash remnant became the newest snapshot. A user clicking to
+rescue 200 tabs would have got one blank window.
+
+Moving the counter to session storage closes this by construction. The
+alarm-fires-first path now behaves as follows: the quiet period may still be
+bypassed — accepted, and unchanged — but the counter reads 0 because the session
+is genuinely new, the suspected-loss rule applies in full, and the first capture
+of a halved layout is skipped. The remnant cannot become the newest snapshot
+until six minutes of the low count persisting, which is the tradeoff this spec
+deliberately made rather than an accident.
+
+`recordStart` writes through an `updateMeta(api, patch)` helper that re-reads
+immediately before writing, rather than writing back a whole object read several
+`await`s earlier. That earlier shape was a real defect: an `onStartup` landing
+inside a capture's `windows.getAll` had its `browserStartedAt` overwritten with
+the stale value the capture had read before it. With the counter moved out,
+`meta` has one field and one writer, so the clobber is gone outright; the patch
+helper is kept as the writer's API so that stays true if `meta` ever gains a
+second field. A serialised lock is rejected either way, because a lock held by a
+worker Manifest V3 can evict mid-hold is worse than the race it closes.
 
 A browser that has just crashed and relaunched into a reduced set of tabs
 therefore cannot overwrite good history during its first minute.
@@ -150,10 +252,15 @@ the tab count has more than halved and the save is skipped as a suspected loss.
 
 **Escape hatch, and it is required.** If the user genuinely closes half their
 tabs, this rule would block every future save forever. So each skip increments
-`meta.consecutiveSuspectedLosses`. When it reaches **3** — six minutes of the
-low count persisting — the save proceeds anyway and the counter resets to 0.
+the session-scoped `consecutiveSuspectedLosses`. When it reaches **3** — six
+minutes of the low count persisting — the save proceeds anyway and the counter
+resets to 0.
 
-Any successful save resets the counter to 0.
+Any successful save resets the counter to 0. The counter is read once, alongside
+the other reads at the top of the capture, so that the `restoreInProgress`
+re-check stays immediately adjacent to the writes it guards with no `await` in
+the gap. Both the increment and the reset are writes, and a half-built restore
+must be allowed to cause neither.
 
 A suspected-loss skip logs one line at `console.log` with the `[Tab Boss] `
 prefix, including both counts, so the behaviour is explicable if the user ever
@@ -181,8 +288,15 @@ A toolbar icon (`manifest.action`) with no popup. `chrome.action.onClicked`
 triggers the restore.
 
 1. Read `snapshots`. If it is empty, or the newest entry's `version` is not 1,
-   show `!` in the action badge for 3 seconds and stop. Restore must never fail
-   silently. The 3-second clear is a `setTimeout` and therefore best-effort — an
+   or its `windows` is not an array, show `!` in the action badge for 3 seconds
+   and stop. Restore must never fail silently. The `windows` check is not
+   belt-and-braces: the store validates only that the stored value is an array,
+   so a stored `{version: 1}` from a corrupted profile — one of the three
+   scenarios this feature exists for — otherwise threw
+   `snapshot.windows is not iterable` out of the `action.onClicked` listener as
+   an unhandled rejection, and the icon did nothing at all. For the same reason
+   the window loop is wrapped, so an unanticipated throw mid-restore still
+   flashes the badge instead of escaping the listener. The 3-second clear is a `setTimeout` and therefore best-effort — an
    evicted service worker may leave the badge up. A lingering `!` is harmless
    and is cleared by the next successful restore, so this does not warrant an
    alarm.
@@ -272,12 +386,12 @@ and no `await` in the gap.
 | File | Responsibility |
 | --- | --- |
 | `src/snapshot.js` | Pure. Build a snapshot from window/tab data, fingerprint it, judge a suspected loss. No browser calls. |
-| `src/snapshotStore.js` | Read, write, and prune `snapshots` and `meta` in `chrome.storage.local`. |
+| `src/snapshotStore.js` | Read, write, and prune `snapshots` and `meta` in `chrome.storage.local`, plus the suspected-loss counter in `chrome.storage.session`. |
 | `src/snapshotScheduler.js` | The alarm, the startup clock, and the three refusal rules. |
 | `src/tabWriter.js` | Shared tab writing, extracted from `src/windowCloning.js`. |
 | `src/restore.js` | Action click, newest snapshot, new windows, badge on failure. |
 | `src/windowCloning.js` | Loses its tab-writing half; gains the `restoreInProgress` check. |
-| `src/state.js` | Gains `restoreInProgress`. |
+| `src/state.js` | Gains `restoreInProgress`, and `installAbortTracking` — the one event-driven writer of `abortedWindowIds`, installed by every feature that builds an abort watch rather than by one on another's behalf. |
 | `src/background.js` | Wires the two new installers. Still no branching. |
 | `manifest.json` | Adds `storage` and `alarms` permissions, and an `action`. |
 
@@ -285,7 +399,9 @@ Every new `src/` module follows the existing rule: no module touches the global
 `chrome`. Each exports an installer or pure functions taking the API as an
 argument, so tests pass `test/fakeChrome.js` instead.
 
-`test/fakeChrome.js` gains `storage.local`, `alarms`, `action`, `runtime`
+`test/fakeChrome.js` gains `storage.local` and `storage.session` (separate
+backing maps, so a test can clear the session one to simulate a browser
+restart), `alarms`, `action`, `runtime`
 events, and `windows.create`.
 
 ## Error handling
@@ -319,12 +435,18 @@ directory argument.
 - Caps at 20, dropping oldest first.
 - Returns the newest correctly.
 - A malformed or absent value reads as empty rather than throwing.
-- `meta` round-trips.
+- `meta` round-trips, and `updateMeta` patches without disturbing other fields.
+- The loss counter round-trips in session storage and never touches local.
+- Clearing session storage leaves the counter at 0 but keeps `browserStartedAt`.
+- A malformed, negative, or unreadable counter reads as 0.
 
 *snapshotScheduler.js*
 - Skips inside the quiet period; saves outside it.
 - A missing `browserStartedAt` does not block a save.
 - Skips on suspected loss and increments the counter.
+- The counter accumulates across ticks and survives a service worker eviction.
+- An alarm firing before `onStartup` cannot save a halved candidate.
+- A restart clears the counter whichever of the alarm and `onStartup` runs first.
 - Saves on the third consecutive suspected loss and resets the counter.
 - A successful save resets the counter.
 - Skips an unchanged layout silently.
@@ -350,10 +472,14 @@ directory argument.
   making no browser calls at all.
 
 Manual smoke test, added to `README.md`:
-1. Open several tabs including a pinned one, a muted one, and a group. Wait two
-   minutes.
-2. Click the Tab Boss icon. A new window appears matching the layout. Existing
-   windows are untouched.
+1. Confirm snapshots are taken under *intermittent* browsing: browse in bursts
+   with 45-second idle gaps, so the service worker is evicted and cold-started
+   repeatedly, then check `snapshots.length` is greater than zero. Continuous
+   use proves nothing here — a worker that never goes idle never cold-starts,
+   and the cold start is what used to reset the alarm.
+2. Open several tabs including a pinned one, a muted one, and two groups. Wait
+   two minutes, then click the Tab Boss icon. A new window appears matching the
+   layout. Existing windows are untouched.
 3. With no snapshots stored, click the icon. The badge shows `!`.
 4. Close half the tabs. Confirm from the service worker console that snapshots
    are skipped, then that one is taken about six minutes later.

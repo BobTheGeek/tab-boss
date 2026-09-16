@@ -1744,3 +1744,67 @@ Spec coverage:
 Deliberate deviation from the spec: the spec's `writeTabs(api, watch, targetId, plan, groups)` returns "the written pairs"; this plan names the entries `{ spec, tab }` rather than the cloner's old `{ source, clone }`, because the writer no longer sees live source tabs. The cloner's `pairs` vocabulary retires with the extraction.
 
 The spec left the `watch` signature to be resolved against merged code. Resolved: `createAbortWatch(state, windowId)` returning `{ aborted(), mark() }`, moved from `src/windowCloning.js` into `src/state.js` in Task 1 Step 1.
+
+---
+
+## Corrections found during execution
+
+Three code blocks in this plan were wrong. Each was caught by a review, not by
+the plan's own self-review. The code blocks above are left as written so the
+record is honest; the corrections below are what actually shipped. **If you are
+reading this plan as a reference, trust this section over the blocks above.**
+
+### Task 1 — `buildGroups` was missing its `try`/`catch`
+
+The listing dropped two behaviours from the `tb-084` crash fix. A `tabs.group`
+failure with the target window still alive should warn once and continue to the
+next group, letting the write complete; the catch-free version unwound the whole
+write instead. Worse, it also dropped the probe-and-mark that stops a second
+`tabs.group` being dispatched into a tab strip already known to be dead — the
+call most likely to trip the browser `CHECK` that crashed the user's browser.
+
+Shipped: the per-group `try`/`catch` from the original `recreateGroups`, moved
+into the writer along with `windowStillOpen`.
+
+### Task 3 — `appendSnapshot` could silently wipe the backup
+
+It built its write from `readSnapshots`, which deliberately swallows any read
+failure and reports `[]`. One transient `storage.local.get` rejection would
+therefore write a single-item array over up to 40 minutes of history — the exact
+opposite of what a backup is for.
+
+Shipped: a separate non-swallowing `readSnapshotsForWrite`. A **rejected** read
+aborts the append; a **malformed** stored value still starts fresh. Those are
+different situations: a rejection means we do not know what is there, a non-array
+means we do and it is unusable.
+
+### Task 5 — restore removed the placeholder from a window known to be gone
+
+`writeTabs` returns whatever it managed to write before unwinding, so
+`written.length > 0` is true even when the window died mid-write. Restore then
+called `tabs.remove` into the destroyed tab strip — the `tb-084` call pattern,
+reintroduced through a new door. `cloneIntoWindow` already had the guard this
+plan forgot to carry across.
+
+Shipped: an abort check before the placeholder removal.
+
+Two further defects were found in Task 5 that this plan did not cause, and are
+recorded here because they are the same class of problem:
+
+- `restoreInProgress` was a bare boolean, so a second toolbar click lowered the
+  guard under an in-flight restore and later restored windows were cloned into.
+  Fixed by bailing when a restore is already running, with the check and the flag
+  assignment as adjacent synchronous statements — a bail alone would only have
+  narrowed the race, not closed it.
+- The single outer `try`/`catch` logged on a routine window close and abandoned
+  every remaining snapshot window. Fixed by moving it inside the loop and gating
+  the warn on the abort watch plus a liveness probe.
+
+### The pattern
+
+All three plan defects were the same mistake: **dropping a guard while moving
+code**, in a codebase where the guards exist because of a crash. Every one was
+caught by an implementer or reviewer reading the code against its purpose rather
+than against the plan. A future plan touching `src/tabWriter.js`,
+`src/windowCloning.js`, or `src/restore.js` should start from the guards and work
+outwards, not from the happy path.
