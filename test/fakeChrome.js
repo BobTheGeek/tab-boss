@@ -35,6 +35,7 @@ export function createFakeChrome(initial = {}) {
   const tabs = new Map();
   const groups = new Map();
   const storage = new Map();
+  const alarms = new Map();
   const calls = [];
   let nextTabId = 1000;
   let nextGroupId = 500;
@@ -153,6 +154,13 @@ export function createFakeChrome(initial = {}) {
         Object.assign(group, props);
         return { ...group };
       },
+
+      async query({ windowId }) {
+        calls.push(["tabGroups.query", windowId]);
+        return [...groups.values()]
+          .filter((group) => group.windowId === windowId)
+          .map((group) => ({ ...group }));
+      },
     },
 
     windows: {
@@ -173,6 +181,24 @@ export function createFakeChrome(initial = {}) {
         if (!win) throw new Error("No open windows");
         return { ...win };
       },
+
+      async getAll() {
+        calls.push(["windows.getAll"]);
+        return [...windows.values()].map((win) => ({ ...win }));
+      },
+    },
+
+    alarms: {
+      onAlarm: createEvent(),
+      async create(name, info) {
+        calls.push(["alarms.create", name, info]);
+        alarms.set(name, info);
+      },
+    },
+
+    runtime: {
+      onStartup: createEvent(),
+      onInstalled: createEvent(),
     },
 
     storage: {
@@ -196,5 +222,5 @@ export function createFakeChrome(initial = {}) {
     },
   };
 
-  return { api, calls, tabs, windows, groups, storage };
+  return { api, calls, tabs, windows, groups, storage, alarms };
 }
