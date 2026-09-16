@@ -164,9 +164,9 @@ async function recreateGroups(api, targetId, pairs, watch) {
  * keep firing calls at a destroyed window, which is what crashed the browser.
  */
 async function copyTabs(api, sourceId, targetId, watch) {
-  // Defence in depth. The caller probes the target's liveness immediately
-  // before this call with nothing awaited in between, so nothing can land
-  // here — but this reads the source window, which is harmless either way.
+  // Reached when the removal event arrived during the gate but the window was
+  // still queryable, so the caller's liveness probe said "alive" and only the
+  // armed watch knows better.
   if (watch.aborted()) return [];
   const sourceTabs = (await api.tabs.query({ windowId: sourceId })).sort(
     (a, b) => a.index - b.index,
@@ -258,7 +258,19 @@ export async function cloneIntoWindow(api, state, newWindow) {
   state.suppressedWindowIds.add(newWindow.id);
   const watch = createAbortWatch(state, newWindow.id);
   try {
-    const newTabs = await api.tabs.query({ windowId: newWindow.id });
+    let newTabs;
+    try {
+      newTabs = await api.tabs.query({ windowId: newWindow.id });
+    } catch (error) {
+      // The window can be closed before the service worker is even scheduled
+      // to run this, which rejects the gate's very first call. Left alone that
+      // escapes into the listener as an unhandled rejection: noise on an
+      // expected race. Silent if the window has gone, findable if it has not.
+      if (await windowStillOpen(api, newWindow.id)) {
+        console.warn("[Tab Boss] clone failed", error);
+      }
+      return false;
+    }
     if (newTabs.length !== 1) return false;
     if (!isBlankTab(newTabs[0])) return false;
     const placeholder = newTabs[0];
