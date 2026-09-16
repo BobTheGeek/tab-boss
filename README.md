@@ -70,6 +70,36 @@ npm test
 
 No dependencies to install. This runs Node's built-in test runner.
 
+## Manual smoke test
+
+The tests run against a fake browser. These five steps check the things only a
+real browser can tell you. Keep the service worker console open throughout:
+`chrome://extensions` → Tab Boss → **service worker**.
+
+1. **Snapshots survive intermittent browsing.** This is the important one, and
+   it has to be done with gaps. Open a few tabs, then leave the browser alone
+   for about 45 seconds — long enough for Chromium to shut the service worker
+   down — then open one more tab. Repeat for five minutes or so. Then run
+   `chrome.storage.local.get("snapshots").then(r => console.log(r.snapshots.length))`
+   in the service worker console. It must be greater than zero.
+
+   Checking this under *continuous* use proves nothing. The failure it exists
+   to catch is the alarm being rescheduled on each cold start, and a worker
+   that never goes idle never cold-starts. If the count is zero, the two-minute
+   alarm is being reset before it can ever fire.
+2. **A layout comes back.** Open several tabs including a pinned one, a muted
+   one, and two tab groups with different names and colours. Wait two minutes.
+   Click the Tab Boss icon. A new window appears matching the layout, and every
+   window you already had is untouched.
+3. **Nothing to restore says so.** Run `chrome.storage.local.clear()` in the
+   service worker console, then click the icon. The badge shows `!` for about
+   three seconds and no window opens.
+4. **A big drop is refused, then accepted.** Close half your tabs. The console
+   logs `[Tab Boss] skipped a snapshot` on the next few ticks, and about six
+   minutes later a snapshot is taken anyway.
+5. **A fresh start is quiet.** Quit the browser and relaunch it. No snapshot is
+   taken during the first minute.
+
 ## Not implemented: pinned tabs 3 per row
 
 Limiting pinned tabs to 3 per row is impossible from an extension. The tab
