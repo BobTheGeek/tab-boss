@@ -1,9 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Tab Boss",
-  "version": "1.0.0",
-  "description": "New tabs go to the bottom. New windows clone the window you came from.",
-  "permissions": ["tabs", "tabGroups"],
+  "version": "1.1.0",
+  "description": "New tabs go to the bottom. New windows clone the window you came from. Your layout is backed up.",
+  "permissions": ["tabs", "tabGroups", "storage", "alarms"],
+  "action": {
+    "default_title": "Tab Boss — restore the newest tab layout"
+  },
   "background": {
     "service_worker": "src/background.js",
     "type": "module"

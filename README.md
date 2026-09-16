@@ -12,9 +12,28 @@ with **Show Tabs Vertically** turned on.
    the new window opens with the same tabs, in the same order, with the same
    pinned tabs, muted tabs, tab groups, and selected tab. Background tabs are
    left unloaded so a large clone does not stall the browser.
+3. **Your layout is backed up.** Every 2 minutes Tab Boss saves a snapshot of
+   all your normal windows — tab order, pinned tabs, muted tabs, tab groups
+   with their names and colours, and which tab was selected. It keeps the last
+   20, about 40 minutes of history. Click the Tab Boss toolbar icon to restore
+   the newest one into brand new windows. Your existing windows are never
+   touched.
+
+   Snapshots are skipped in three cases: during the first minute after the
+   browser starts, when the tab count has more than halved since the last one,
+   and when nothing has changed. The first two exist so a crash cannot poison
+   the backup with a post-crash remnant. If you genuinely close half your tabs,
+   the low count is accepted after about six minutes.
+
+   If there is nothing to restore, the toolbar icon shows a `!` for a moment.
+
+   Snapshots are stored on this machine only. They are never synced and never
+   leave the browser. Incognito windows are never captured or restored.
 
 Dragging a tab out, popup windows opened by a page, incognito windows, and
-session restore on startup are all left alone.
+session restore on startup are all left alone. This extension requires four
+permissions: `tabs` and `tabGroups` to manage window and tab state, `storage`
+to keep snapshots, and `alarms` to schedule automatic saves.
 
 ### What cannot be copied
 

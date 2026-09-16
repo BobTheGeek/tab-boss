@@ -1,6 +1,8 @@
 import { createState } from "./state.js";
 import { installFocusTracking, seedFocus } from "./focusTracking.js";
 import { installNewTabPlacement } from "./newTabPlacement.js";
+import { installRestore } from "./restore.js";
+import { installSnapshotScheduler } from "./snapshotScheduler.js";
 import { installWindowCloning } from "./windowCloning.js";
 
 const state = createState();
@@ -10,5 +12,7 @@ const state = createState();
 installFocusTracking(chrome, state);
 installNewTabPlacement(chrome, state);
 installWindowCloning(chrome, state);
+installSnapshotScheduler(chrome);
+installRestore(chrome, state);
 
 void seedFocus(chrome, state);
