@@ -112,6 +112,20 @@ test("a popup source window is not cloned from", async () => {
   assert.equal(cloned, false);
 });
 
+test("a window that is itself being cloned into is never a clone source", async () => {
+  const { fake, state } = setupClonable();
+  // Window 1 is mid-clone: its tabs are not meaningful yet.
+  state.suppressedWindowIds.add(1);
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(cloned, false);
+  assert.equal(
+    fake.calls.some(([name]) => name === "tabs.create"),
+    false,
+  );
+  // The source's own suppression must survive untouched.
+  assert.equal(state.suppressedWindowIds.has(1), true);
+});
+
 test("the source is current when focus fired before creation", async () => {
   const { fake, state } = setupClonable();
   recordFocus(state, 2);
@@ -142,8 +156,10 @@ test("the suppression flag is cleared even when the clone throws", async () => {
   fake.api.tabs.create = async () => {
     throw new Error("boom");
   };
-  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
   assert.equal(state.suppressedWindowIds.has(2), false);
+  // A swallowed failure is not a clone that ran.
+  assert.equal(cloned, false);
 });
 
 test("a window closing mid-clone is a silent race, not a logged failure", async () => {
@@ -155,13 +171,15 @@ test("a window closing mid-clone is a silent race, not a logged failure", async 
   const warnings = [];
   const originalWarn = console.warn;
   console.warn = (...args) => warnings.push(args);
+  let cloned;
   try {
-    await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+    cloned = await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
   } finally {
     console.warn = originalWarn;
   }
   assert.deepEqual(warnings, []);
   assert.equal(state.suppressedWindowIds.has(2), false);
+  assert.equal(cloned, false);
 });
 
 test("isClonableUrl rejects URLs an extension may not reopen", () => {
@@ -171,7 +189,12 @@ test("isClonableUrl rejects URLs an extension may not reopen", () => {
   assert.equal(isClonableUrl("chrome-untrusted://foo/"), false);
   assert.equal(isClonableUrl("devtools://devtools/"), false);
   assert.equal(isClonableUrl("file:///Users/me/notes.txt"), false);
-  assert.equal(isClonableUrl("about:blank"), false);
+  assert.equal(isClonableUrl("view-source:https://example.com/"), false);
+  assert.equal(isClonableUrl("edge://settings/"), false);
+  // about:blank is the one about: URL an extension may reopen.
+  assert.equal(isClonableUrl("about:blank"), true);
+  assert.equal(isClonableUrl("about:version"), false);
+  assert.equal(isClonableUrl("about:srcdoc"), false);
   assert.equal(isClonableUrl("ego://newtab/"), false);
   assert.equal(isClonableUrl(""), false);
   assert.equal(isClonableUrl(undefined), false);
@@ -251,6 +274,113 @@ test("unclonable tabs are skipped and the rest still clone", async () => {
   assert.deepEqual(
     clonedTabs(fake, 2).map((tab) => tab.url),
     ["https://b.test/"],
+  );
+});
+
+test("skipped tabs are routine news, not a warning", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "chrome://settings/" },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+
+  const logs = [];
+  const warnings = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args) => logs.push(args);
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+
+  assert.deepEqual(warnings, []);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0][0], /^\[Tab Boss\] skipped 1 tab/);
+});
+
+test("a still-loading source tab is cloned from its pending URL", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    tabs: [
+      {
+        id: 10,
+        windowId: 1,
+        index: 0,
+        url: "",
+        pendingUrl: "https://loading.test/",
+      },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.deepEqual(
+    clonedTabs(fake, 2).map((tab) => tab.url),
+    ["https://loading.test/", "https://b.test/"],
+  );
+});
+
+test("a source with nothing clonable leaves the new window alive and non-empty", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "chrome://newtab/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  // Removing the last tab would close the window in a real browser.
+  assert.equal(fake.tabs.has(20), true);
+  assert.equal(fake.windows.has(2), true);
+  assert.equal(clonedTabs(fake, 2).length, 1);
+});
+
+test("the clone source is resolved before the first await", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }, { id: 3 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://right.test/" },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+      { id: 30, windowId: 3, index: 0, url: "https://wrong.test/" },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+
+  // A second Cmd+N focuses window 3 while this clone is still in its gate.
+  const query = fake.api.tabs.query;
+  let interrupted = false;
+  fake.api.tabs.query = async (args) => {
+    const result = await query(args);
+    if (!interrupted) {
+      interrupted = true;
+      recordFocus(state, 3);
+    }
+    return result;
+  };
+
+  await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+
+  assert.deepEqual(
+    clonedTabs(fake, 2).map((tab) => tab.url),
+    ["https://right.test/"],
+  );
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "windows.get"),
+    [["windows.get", 1]],
   );
 });
 

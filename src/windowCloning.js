@@ -50,8 +50,12 @@ const UNCLONABLE_PREFIXES = [
   "view-source:",
 ];
 
+/** The one `about:` URL an extension is allowed to reopen. */
+const CLONABLE_ABOUT_URL = "about:blank";
+
 export function isClonableUrl(url) {
   if (!url) return false;
+  if (url === CLONABLE_ABOUT_URL) return true;
   return !UNCLONABLE_PREFIXES.some((prefix) => url.startsWith(prefix));
 }
 
@@ -120,13 +124,16 @@ async function copyTabs(api, sourceId, targetId) {
   let skipped = 0;
 
   for (const source of sourceTabs) {
-    if (!isClonableUrl(source.url)) {
+    // A tab whose navigation has not committed reports an empty url and
+    // carries its destination in pendingUrl, exactly as isBlankTab assumes.
+    const url = source.url || source.pendingUrl || "";
+    if (!isClonableUrl(url)) {
       skipped += 1;
       continue;
     }
     const clone = await api.tabs.create({
       windowId: targetId,
-      url: source.url,
+      url,
       pinned: source.pinned,
       active: false,
     });
@@ -134,7 +141,8 @@ async function copyTabs(api, sourceId, targetId) {
   }
 
   if (skipped > 0) {
-    console.warn(
+    // Routine: a pinned chrome:// tab would warn on every single Cmd+N.
+    console.log(
       `[Tab Boss] skipped ${skipped} tab(s) the browser will not let an extension reopen`,
     );
   }
@@ -173,6 +181,13 @@ async function copyTabs(api, sourceId, targetId) {
  * and a session restore holds many tabs. Only a deliberate Cmd+N passes.
  */
 export async function cloneIntoWindow(api, state, newWindow) {
+  // Resolved before the first await. Any windows.onFocusChanged landing while
+  // this function is suspended rewrites the focus history the source is
+  // derived from, so two quick Cmd+N presses would otherwise clone each other.
+  // It is a pure read of state, so computing it for windows that later fail
+  // the gate costs nothing.
+  const sourceId = resolveSourceWindowId(state, newWindow.id);
+
   if (newWindow.incognito) return false;
   if (newWindow.type !== "normal") return false;
 
@@ -181,8 +196,10 @@ export async function cloneIntoWindow(api, state, newWindow) {
   if (!isBlankTab(newTabs[0])) return false;
   const placeholder = newTabs[0];
 
-  const sourceId = resolveSourceWindowId(state, newWindow.id);
   if (sourceId == null || sourceId === newWindow.id) return false;
+  // A window still being filled by the cloner holds no meaningful contents
+  // yet, so cloning it would copy a half-built window.
+  if (state.suppressedWindowIds.has(sourceId)) return false;
 
   let source;
   try {
@@ -194,8 +211,13 @@ export async function cloneIntoWindow(api, state, newWindow) {
 
   state.suppressedWindowIds.add(newWindow.id);
   try {
-    await copyTabs(api, source.id, newWindow.id);
-    await api.tabs.remove(placeholder.id);
+    const pairs = await copyTabs(api, source.id, newWindow.id);
+    // Removing a window's last tab closes the window. If every source tab was
+    // unclonable there is nothing to replace the placeholder with, so leave a
+    // plain empty window rather than making the new window vanish.
+    if (pairs.length > 0) {
+      await api.tabs.remove(placeholder.id);
+    }
   } catch (error) {
     // The user can close the new window mid-clone, which fails every pending
     // call. That is an expected race and stays silent. Anything else is a real
@@ -203,6 +225,7 @@ export async function cloneIntoWindow(api, state, newWindow) {
     if (await windowStillOpen(api, newWindow.id)) {
       console.warn("[Tab Boss] clone failed", error);
     }
+    return false;
   } finally {
     state.suppressedWindowIds.delete(newWindow.id);
   }

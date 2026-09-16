@@ -106,8 +106,15 @@ export function createFakeChrome(initial = {}) {
 
       async remove(tabId) {
         calls.push(["tabs.remove", tabId]);
-        requireTab(tabId);
+        const { windowId } = requireTab(tabId);
         tabs.delete(tabId);
+        // Chromium closes a window when its last tab is removed. Modelling
+        // that here is what stops an "emptied the new window" bug from
+        // looking harmless in tests.
+        const stillOpen = [...tabs.values()].some(
+          (tab) => tab.windowId === windowId,
+        );
+        if (!stillOpen) windows.delete(windowId);
       },
 
       async discard(tabId) {
