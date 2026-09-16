@@ -16,6 +16,11 @@ export const TAB_GROUP_ID_NONE = -1;
  * it. It is only ever written for a window that is currently an in-flight
  * clone target, and the clone clears its own id when it unwinds, so it cannot
  * grow without bound.
+ * `restoreInProgress` is true while restore is creating windows. Restore calls
+ * windows.create, which fires windows.onCreated, which is what the cloner
+ * listens for — without this the cloner would clone every restored window.
+ * suppressedWindowIds cannot do the job: the id is not known until create
+ * resolves, and onCreated can fire first.
  */
 export function createState() {
   return {
@@ -23,6 +28,7 @@ export function createState() {
     currentWindowId: null,
     suppressedWindowIds: new Set(),
     abortedWindowIds: new Set(),
+    restoreInProgress: false,
   };
 }
 

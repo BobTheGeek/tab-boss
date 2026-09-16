@@ -37,8 +37,10 @@ export function createFakeChrome(initial = {}) {
   const storage = new Map();
   const alarms = new Map();
   const calls = [];
+  const badge = { text: "" };
   let nextTabId = 1000;
   let nextGroupId = 500;
+  let nextWindowId = 50;
 
   for (const win of initial.windows ?? []) {
     windows.set(win.id, { ...WINDOW_DEFAULTS, ...win });
@@ -186,6 +188,30 @@ export function createFakeChrome(initial = {}) {
         calls.push(["windows.getAll"]);
         return [...windows.values()].map((win) => ({ ...win }));
       },
+
+      async create(createData = {}) {
+        calls.push(["windows.create", createData]);
+        const id = nextWindowId++;
+        windows.set(id, { ...WINDOW_DEFAULTS, id, ...createData });
+        const tabId = nextTabId++;
+        tabs.set(tabId, {
+          ...TAB_DEFAULTS,
+          id: tabId,
+          windowId: id,
+          index: 0,
+          url: "about:blank",
+          active: true,
+        });
+        return { ...windows.get(id) };
+      },
+    },
+
+    action: {
+      onClicked: createEvent(),
+      async setBadgeText(details) {
+        calls.push(["action.setBadgeText", details]);
+        badge.text = details.text;
+      },
     },
 
     alarms: {
@@ -222,5 +248,5 @@ export function createFakeChrome(initial = {}) {
     },
   };
 
-  return { api, calls, tabs, windows, groups, storage, alarms };
+  return { api, calls, tabs, windows, groups, storage, alarms, badge };
 }

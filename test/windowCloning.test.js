@@ -67,6 +67,14 @@ test("a popup new window is never cloned into", async () => {
   assert.equal(cloned, false);
 });
 
+test("the cloner ignores a window while a restore is running", async () => {
+  const { fake, state } = setupClonable();
+  state.restoreInProgress = true;
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(cloned, false);
+  assert.deepEqual(fake.calls, [], "it must not even look at the window");
+});
+
 test("a window holding a real page is not cloned into", async () => {
   const fake = createFakeChrome({
     windows: [{ id: 1 }, { id: 2 }],

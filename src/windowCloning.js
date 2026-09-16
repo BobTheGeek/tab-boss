@@ -103,6 +103,10 @@ async function planFromWindow(api, sourceId, watch) {
  * and a session restore holds many tabs. Only a deliberate Cmd+N passes.
  */
 export async function cloneIntoWindow(api, state, newWindow) {
+  // Restore creates windows of its own. Both this check and the flag's setter
+  // are synchronous, so no event can interleave between them.
+  if (state.restoreInProgress) return false;
+
   // Resolved before the first await. Any windows.onFocusChanged landing while
   // this function is suspended rewrites the focus history the source is
   // derived from, so two quick Cmd+N presses would otherwise clone each other.
