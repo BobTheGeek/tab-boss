@@ -112,14 +112,56 @@ A `chrome.alarms` alarm named `tab-boss-snapshot` with
 Manifest V3 evicts the service worker when idle and a timer dies with it; an
 alarm wakes the worker back up.
 
-`chrome.alarms.create` is idempotent for a given name, so the alarm is created
-unconditionally at the top level of the service worker. No separate
-`onInstalled` / `onStartup` creation path is needed.
+**Correction.** An earlier draft of this spec claimed `chrome.alarms.create` is
+idempotent for a given name and that the alarm could therefore be created
+unconditionally at the top level of the service worker. That is wrong, and it
+would have stopped the feature working at all.
+
+Chromium's documentation says the opposite: "If there is another alarm with the
+same name (or no name if none is specified), it will be cancelled and replaced
+by this alarm." It also says that when only `periodInMinutes` is set,
+"`periodInMinutes` is used as the default for `delayInMinutes`" — so every
+`create` call schedules the first fire at now + 2 minutes.
+
+The service worker installer runs on every cold start, and Manifest V3 evicts
+the worker after roughly 30 seconds idle. Tab Boss listens for
+`tabs.onCreated`, `windows.onCreated`, `windows.onFocusChanged` and
+`windows.onRemoved`, so ordinary intermittent browsing cold-starts it
+constantly. Creating unconditionally would reset the alarm's clock each time
+and it would never reach two minutes: no snapshots, no error, no log, and an
+empty store the user only discovers when they need it.
+
+So the alarm is created **only when `chrome.alarms.get` reports none**:
+
+```js
+if (!(await api.alarms.get(SNAPSHOT_ALARM))) {
+  await api.alarms.create(SNAPSHOT_ALARM, {
+    periodInMinutes: SNAPSHOT_PERIOD_MINUTES,
+    persistAcrossSessions: true,
+  });
+}
+```
+
+Listener registration stays synchronous and above that check, because Manifest
+V3 will not wake an evicted worker for a listener registered inside an awaited
+callback. `persistAcrossSessions` is set explicitly rather than left to
+Chromium's `true` default, so the alarm survives a browser restart on any
+browser. No separate `onInstalled` / `onStartup` creation path is needed.
 
 ## Refusing to save
 
 Three rules, evaluated in this order. Any rule that fires skips the save
 entirely — nothing is written and nothing is pruned.
+
+Ahead of all three sits a guard rather than a rule: a capture refuses outright
+while `state.restoreInProgress` is set, returning `"restoring"`. Mid-restore the
+browser holds a remnant plus a part-built window, and storing that would make it
+the newest snapshot — so a click within the next two minutes would restore the
+half-finished restore. The next tick self-heals, but a several-hundred-tab
+restore runs longer than the two-minute period, which turns a possibility into a
+certainty. The flag is checked at the top of the capture and again immediately
+before the write, with no `await` in the gap, because the first check cannot see
+a toolbar click that landed while the windows were being read.
 
 When there is no stored snapshot yet, rules 2 and 3 do not apply — they both
 compare against a previous snapshot that does not exist. Only the quiet period
@@ -127,8 +169,32 @@ can block the very first save.
 
 ### 1. Quiet period
 
-`chrome.runtime.onStartup` writes `meta.browserStartedAt = Date.now()`.
-A save is skipped while `Date.now() - meta.browserStartedAt < 60_000`.
+`chrome.runtime.onStartup` writes `meta.browserStartedAt = Date.now()` **and
+resets `meta.consecutiveSuspectedLosses` to 0**. A save is skipped while
+`Date.now() - meta.browserStartedAt < 60_000`.
+
+The counter reset matters as much as the clock. A fresh browser session is not a
+continuation of yesterday's evidence that the user deliberately closed half
+their tabs. Carried over, a counter sitting at 2 when the browser went down
+would let the very first capture of the new session take the escape hatch below
+and make a post-crash remnant the newest snapshot — collapsing the six-minute
+buffer to nothing.
+
+**Known gap.** The reset only helps once `onStartup` has actually run. A
+persisted alarm that is already overdue can fire first, and a capture at that
+moment still reads the previous session's counter *and* the previous session's
+`browserStartedAt`, so it bypasses the quiet period and can take the escape
+hatch immediately. Closing that properly needs the counter held somewhere the
+browser clears on restart by itself — `chrome.storage.session` — rather than a
+reset that races the alarm. Left open deliberately; see the final review notes.
+
+Both writers patch only the fields they own, through a `updateMeta(api, patch)`
+helper that re-reads immediately before writing, rather than writing back a
+whole object read several `await`s earlier. Without that, an `onStartup` landing
+inside a capture's `windows.getAll` had its `browserStartedAt` overwritten with
+the stale value. It narrows the race to a single storage round trip rather than
+eliminating it; a serialised lock is rejected, because a lock held by a worker
+Manifest V3 can evict mid-hold is worse than the race it closes.
 
 A browser that has just crashed and relaunched into a reduced set of tabs
 therefore cannot overwrite good history during its first minute.
@@ -181,8 +247,15 @@ A toolbar icon (`manifest.action`) with no popup. `chrome.action.onClicked`
 triggers the restore.
 
 1. Read `snapshots`. If it is empty, or the newest entry's `version` is not 1,
-   show `!` in the action badge for 3 seconds and stop. Restore must never fail
-   silently. The 3-second clear is a `setTimeout` and therefore best-effort — an
+   or its `windows` is not an array, show `!` in the action badge for 3 seconds
+   and stop. Restore must never fail silently. The `windows` check is not
+   belt-and-braces: the store validates only that the stored value is an array,
+   so a stored `{version: 1}` from a corrupted profile — one of the three
+   scenarios this feature exists for — otherwise threw
+   `snapshot.windows is not iterable` out of the `action.onClicked` listener as
+   an unhandled rejection, and the icon did nothing at all. For the same reason
+   the window loop is wrapped, so an unanticipated throw mid-restore still
+   flashes the badge instead of escaping the listener. The 3-second clear is a `setTimeout` and therefore best-effort — an
    evicted service worker may leave the badge up. A lingering `!` is harmless
    and is cleared by the next successful restore, so this does not warrant an
    alarm.
@@ -277,7 +350,7 @@ and no `await` in the gap.
 | `src/tabWriter.js` | Shared tab writing, extracted from `src/windowCloning.js`. |
 | `src/restore.js` | Action click, newest snapshot, new windows, badge on failure. |
 | `src/windowCloning.js` | Loses its tab-writing half; gains the `restoreInProgress` check. |
-| `src/state.js` | Gains `restoreInProgress`. |
+| `src/state.js` | Gains `restoreInProgress`, and `installAbortTracking` — the one event-driven writer of `abortedWindowIds`, installed by every feature that builds an abort watch rather than by one on another's behalf. |
 | `src/background.js` | Wires the two new installers. Still no branching. |
 | `manifest.json` | Adds `storage` and `alarms` permissions, and an `action`. |
 
@@ -350,10 +423,14 @@ directory argument.
   making no browser calls at all.
 
 Manual smoke test, added to `README.md`:
-1. Open several tabs including a pinned one, a muted one, and a group. Wait two
-   minutes.
-2. Click the Tab Boss icon. A new window appears matching the layout. Existing
-   windows are untouched.
+1. Confirm snapshots are taken under *intermittent* browsing: browse in bursts
+   with 45-second idle gaps, so the service worker is evicted and cold-started
+   repeatedly, then check `snapshots.length` is greater than zero. Continuous
+   use proves nothing here — a worker that never goes idle never cold-starts,
+   and the cold start is what used to reset the alarm.
+2. Open several tabs including a pinned one, a muted one, and two groups. Wait
+   two minutes, then click the Tab Boss icon. A new window appears matching the
+   layout. Existing windows are untouched.
 3. With no snapshots stored, click the icon. The badge shows `!`.
 4. Close half the tabs. Confirm from the service worker console that snapshots
    are skipped, then that one is taken about six minutes later.

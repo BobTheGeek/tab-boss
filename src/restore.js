@@ -1,6 +1,6 @@
 import { SNAPSHOT_VERSION } from "./snapshot.js";
 import { newestSnapshot } from "./snapshotStore.js";
-import { createAbortWatch } from "./state.js";
+import { createAbortWatch, installAbortTracking } from "./state.js";
 import { windowStillOpen, writeTabs } from "./tabWriter.js";
 
 /** How long the failure badge stays up. */
@@ -100,7 +100,17 @@ export async function restoreNewest(api, state) {
   let created = 0;
   try {
     const snapshot = await newestSnapshot(api);
-    if (snapshot === null || snapshot.version !== SNAPSHOT_VERSION) {
+    // `windows` is checked as well as `version`, because a corrupted profile is
+    // one of the three scenarios this feature exists for and the store only
+    // validates that the snapshots value is an array. A stored `{version: 1}`
+    // used to reach the loop below and throw "snapshot.windows is not
+    // iterable" out of the action.onClicked listener as an unhandled
+    // rejection: no window, no badge, and an icon the user clicks in vain.
+    if (
+      snapshot === null ||
+      snapshot.version !== SNAPSHOT_VERSION ||
+      !Array.isArray(snapshot.windows)
+    ) {
       // Restore must never fail silently: the user pressed a button.
       await flashBadge(api);
       return 0;
@@ -112,8 +122,18 @@ export async function restoreNewest(api, state) {
       // Best effort: a badge that will not clear must not stop a restore.
     }
 
-    for (const snapshotWindow of snapshot.windows) {
-      created += await restoreWindow(api, state, snapshotWindow);
+    try {
+      for (const snapshotWindow of snapshot.windows) {
+        created += await restoreWindow(api, state, snapshotWindow);
+      }
+    } catch (error) {
+      // restoreWindow already absorbs the failures it can name, so reaching
+      // here means something unanticipated broke. Whatever it was, an
+      // exception escaping into the action.onClicked listener would leave the
+      // user clicking an icon that does nothing, which is the one outcome this
+      // feature may not have. Windows already restored are kept.
+      console.warn("[Tab Boss] restore failed", error);
+      await flashBadge(api);
     }
   } finally {
     state.restoreInProgress = false;
@@ -126,4 +146,10 @@ export function installRestore(api, state) {
   api.action.onClicked.addListener(async () => {
     await restoreNewest(api, state);
   });
+
+  // Restore owns its own crash protection. The abort watch above is only armed
+  // by this listener, and leaving another feature's installer to register it
+  // meant restore's tb-084 protection could be removed without a single test
+  // noticing. Registering it twice is harmless.
+  installAbortTracking(api, state);
 }

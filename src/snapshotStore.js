@@ -65,6 +65,28 @@ export async function readMeta(api) {
   return { ...DEFAULT_META, ...stored };
 }
 
+/** Replaces `meta` wholesale. Tests use this to seed a known starting state. */
 export async function writeMeta(api, meta) {
   await api.storage.local.set({ [META_KEY]: meta });
+}
+
+/**
+ * Merges `patch` into the stored `meta`.
+ *
+ * `meta` has two writers — the capture and the browser-start recorder — and
+ * they overlap: a persisted alarm that is overdue fires at startup, so a
+ * capture can be suspended in the middle of reading windows when onStartup
+ * lands. A caller that reads the whole object, awaits several browser calls,
+ * and writes a derivative back therefore clobbers whatever the other writer
+ * stored in between.
+ *
+ * Every caller should patch only the fields it owns. That keeps the read and
+ * the write one storage round trip apart instead of five, and means the loser
+ * of the remaining narrow race overwrites a field with the same value rather
+ * than with a stale one. It is deliberately not serialised: a lock held by a
+ * service worker that Manifest V3 can evict mid-hold is worse than the race.
+ */
+export async function updateMeta(api, patch) {
+  const meta = await readMeta(api);
+  await api.storage.local.set({ [META_KEY]: { ...meta, ...patch } });
 }

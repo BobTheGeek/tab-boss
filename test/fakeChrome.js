@@ -202,7 +202,16 @@ export function createFakeChrome(initial = {}) {
           url: "about:blank",
           active: true,
         });
-        return { ...windows.get(id) };
+        const created = { ...windows.get(id) };
+        // Chromium announces a new window before the create call resolves, so
+        // a listener can see it BEFORE the caller learns its id. Restoring
+        // depends on that being true here: suppressedWindowIds cannot cover a
+        // window whose id nobody knows yet, which is the whole reason
+        // state.restoreInProgress exists. A fake that only emitted after
+        // returning would make that guard untestable.
+        await api.windows.onCreated.emit(created);
+        await api.windows.onFocusChanged.emit(id);
+        return created;
       },
     },
 
@@ -218,7 +227,15 @@ export function createFakeChrome(initial = {}) {
       onAlarm: createEvent(),
       async create(name, info) {
         calls.push(["alarms.create", name, info]);
+        // Chromium cancels and replaces a same-name alarm rather than leaving
+        // the existing one alone, and re-derives its first fire time. Set is
+        // the right model: the new schedule wins.
         alarms.set(name, info);
+      },
+      async get(name) {
+        calls.push(["alarms.get", name]);
+        // chrome.alarms.get resolves with undefined for an unknown name.
+        return alarms.has(name) ? { name, ...alarms.get(name) } : undefined;
       },
     },
 

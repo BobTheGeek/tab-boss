@@ -4,6 +4,7 @@ import { createFakeChrome } from "./fakeChrome.js";
 import { createState } from "../src/state.js";
 import { appendSnapshot } from "../src/snapshotStore.js";
 import { SNAPSHOT_VERSION } from "../src/snapshot.js";
+import { installFocusTracking, seedFocus } from "../src/focusTracking.js";
 import { installWindowCloning } from "../src/windowCloning.js";
 import { installRestore, restoreNewest } from "../src/restore.js";
 
@@ -61,10 +62,11 @@ async function silently(run) {
  * Closes a window the way Chromium does — its tabs go with it — and delivers
  * windows.onRemoved.
  *
- * installWindowCloning supplies the only listener that records a close into
- * state.abortedWindowIds, which is why the tests below install the cloner.
- * Without it the abort watch restore builds can never fire, and every guard
- * that depends on it reads false forever.
+ * Recording that close into state.abortedWindowIds is what arms the abort
+ * watch restore builds; without it every guard that depends on it reads false
+ * forever. installRestore now registers that listener itself, so these tests
+ * no longer borrow it from installWindowCloning — see "restore brings its own
+ * abort tracking", which installs nothing else and still catches the close.
  */
 async function closeWindow(fake, windowId) {
   for (const [id, tab] of [...fake.tabs]) {
@@ -156,6 +158,51 @@ test("groups are recreated with title, colour, and collapsed state", async () =>
   assert.equal(group.title, "Research");
   assert.equal(group.color, "blue");
   assert.equal(group.collapsed, true);
+});
+
+test("two groups in one window are rebuilt separately with their own tabs", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      {
+        focused: true,
+        groups: [
+          { key: 0, title: "Research", color: "blue", collapsed: false },
+          { key: 1, title: "Work", color: "red", collapsed: true },
+        ],
+        tabs: [
+          tabSpec("https://r1.test/", { groupKey: 0 }),
+          tabSpec("https://w1.test/", { groupKey: 1 }),
+          tabSpec("https://r2.test/", { groupKey: 0 }),
+          tabSpec("https://loose.test/", { active: true }),
+          tabSpec("https://w2.test/", { groupKey: 1 }),
+        ],
+      },
+    ]),
+  );
+
+  await restoreNewest(fake.api, state);
+
+  const [windowId] = createdWindowIds(fake);
+  const byUrl = new Map(tabsOf(fake, windowId).map((tab) => [tab.url, tab]));
+  const research = byUrl.get("https://r1.test/").groupId;
+  const work = byUrl.get("https://w1.test/").groupId;
+
+  assert.notEqual(research, work, "two snapshot groups must not collapse into one");
+  assert.equal(byUrl.get("https://r2.test/").groupId, research);
+  assert.equal(byUrl.get("https://w2.test/").groupId, work);
+  assert.equal(byUrl.get("https://loose.test/").groupId, -1, "an ungrouped tab must stay ungrouped");
+
+  assert.deepEqual(
+    [fake.groups.get(research).title, fake.groups.get(research).color, fake.groups.get(research).collapsed],
+    ["Research", "blue", false],
+  );
+  assert.deepEqual(
+    [fake.groups.get(work).title, fake.groups.get(work).color, fake.groups.get(work).collapsed],
+    ["Work", "red", true],
+  );
 });
 
 test("every snapshot window becomes its own new window", async () => {
@@ -268,6 +315,83 @@ const THREE_TABS = snapshot([
     ],
   },
 ]);
+
+test("restore brings its own abort tracking and is never called into a closed window", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(fake.api, THREE_TABS);
+  // The window cloner is deliberately NOT installed. Restore's tb-084 crash
+  // protection must be wired by restore itself: with the cloner supplying the
+  // only windows.onRemoved listener, deleting installWindowCloning from
+  // background.js silently disarmed every abort check in the writer while the
+  // whole suite stayed green.
+  installRestore(fake.api, state);
+
+  const create = fake.api.tabs.create;
+  let callsAtClose = null;
+  fake.api.tabs.create = async (props) => {
+    const tab = await create(props);
+    if (callsAtClose === null) {
+      await closeWindow(fake, props.windowId);
+      callsAtClose = fake.calls.length;
+    }
+    return tab;
+  };
+
+  await fake.api.action.onClicked.emit({});
+
+  assert.notEqual(callsAtClose, null, "the window must really have closed mid-write");
+  assert.deepEqual(
+    fake.calls.slice(callsAtClose),
+    [],
+    "a call into a destroyed tab strip can take the whole browser down",
+  );
+});
+
+test("a stored snapshot with no windows array shows the badge instead of throwing", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(fake.api, { version: SNAPSHOT_VERSION });
+  assert.equal(await restoreNewest(fake.api, state), 0);
+  assert.equal(fake.badge.text, "!");
+});
+
+test("clicking the icon with a malformed snapshot stored never does nothing at all", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  // A corrupted profile is one of the three scenarios this feature exists for,
+  // so the corruption must not land in the one code path meant to rescue it.
+  // Unguarded, this threw out of the action.onClicked listener as an unhandled
+  // rejection: no window, no badge, and an icon the user clicks in vain.
+  await appendSnapshot(fake.api, { version: SNAPSHOT_VERSION, windows: "nope" });
+  installRestore(fake.api, state);
+
+  await fake.api.action.onClicked.emit({});
+
+  assert.equal(fake.badge.text, "!", "the user pressed a button; restore must never fail silently");
+  assert.deepEqual(createdWindowIds(fake), []);
+});
+
+test("an unexpected throw mid-restore still flashes the badge", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(fake.api, TWO_TABS);
+  // Something below restoreWindow's own catch fails. Whatever it was, the user
+  // must not be left clicking an icon that does nothing.
+  state.suppressedWindowIds = {
+    has: () => false,
+    delete: () => {},
+    add() {
+      throw new Error("boom");
+    },
+  };
+
+  const { warnings } = await recording(() => restoreNewest(fake.api, state));
+
+  assert.equal(fake.badge.text, "!");
+  assert.equal(warnings.length, 1, "an unexpected failure must be findable in the console");
+  assert.equal(state.restoreInProgress, false);
+});
 
 test("a window closed mid-write is never called into again", async () => {
   const fake = createFakeChrome();
@@ -471,6 +595,45 @@ test("a created window that is not a lone placeholder is left intact", async () 
   assert.deepEqual(
     tabsOf(fake, windowId).map((tab) => tab.url),
     ["about:blank", "https://theirs.test/", "https://a.test/", "https://b.test/"],
+  );
+});
+
+test("a restored window is not cloned by the window cloner", async () => {
+  // The whole feature wired together: the user has a focused window of their
+  // own, the cloner and focus tracking are live, and the fake announces a new
+  // window the way Chromium does — windows.onCreated BEFORE windows.create
+  // resolves, so suppressedWindowIds cannot possibly cover it yet. Only
+  // state.restoreInProgress stands between the restored window and a copy of
+  // the user's tabs landing on top of it.
+  const fake = createFakeChrome({
+    windows: [{ id: 1, focused: true }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://mine-1.test/", active: true },
+      { id: 11, windowId: 1, index: 1, url: "https://mine-2.test/" },
+    ],
+  });
+  const state = createState();
+  installFocusTracking(fake.api, state);
+  installWindowCloning(fake.api, state);
+  await seedFocus(fake.api, state);
+  assert.equal(state.currentWindowId, 1, "the cloner must have a source to copy from");
+
+  await appendSnapshot(fake.api, TWO_TABS);
+  installRestore(fake.api, state);
+
+  await silently(() => fake.api.action.onClicked.emit({}));
+
+  const restored = createdWindowIds(fake);
+  assert.equal(restored.length, 1);
+  assert.deepEqual(
+    tabsOf(fake, restored[0]).map((tab) => tab.url),
+    ["https://a.test/", "https://b.test/"],
+    "the cloner dumped the user's focused window on top of the restored tabs",
+  );
+  assert.deepEqual(
+    tabsOf(fake, 1).map((tab) => tab.url),
+    ["https://mine-1.test/", "https://mine-2.test/"],
+    "the window the user already had open must be left exactly as it was",
   );
 });
 

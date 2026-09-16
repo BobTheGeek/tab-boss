@@ -32,6 +32,69 @@ const ONE_WINDOW = [
   },
 ];
 
+test("two groups in one window get distinct keys and keep their own tabs", () => {
+  // One group is the case where an off-by-one in the remap is invisible: key 0
+  // is what both a correct map and a broken one produce. Restore is now the
+  // consumer of these keys, so a second group has to be pinned.
+  const snap = buildSnapshot(
+    [
+      {
+        window: win(),
+        tabs: [
+          tab({ url: "https://r1.test/", groupId: 77 }),
+          tab({ url: "https://w1.test/", groupId: 88 }),
+          tab({ url: "https://r2.test/", groupId: 77 }),
+          tab({ url: "https://loose.test/", active: true }),
+          tab({ url: "https://w2.test/", groupId: 88 }),
+        ],
+        groups: [
+          { id: 77, title: "Research", color: "blue", collapsed: false },
+          { id: 88, title: "Work", color: "red", collapsed: true },
+        ],
+      },
+    ],
+    0,
+  );
+
+  assert.deepEqual(snap.windows[0].groups, [
+    { key: 0, title: "Research", color: "blue", collapsed: false },
+    { key: 1, title: "Work", color: "red", collapsed: true },
+  ]);
+  assert.deepEqual(
+    snap.windows[0].tabs.map((t) => [t.url, t.groupKey]),
+    [
+      ["https://r1.test/", 0],
+      ["https://w1.test/", 1],
+      ["https://r2.test/", 0],
+      ["https://loose.test/", null],
+      ["https://w2.test/", 1],
+    ],
+  );
+});
+
+test("group keys follow the groups array, not the order the tabs appear in", () => {
+  // The first tab belongs to the second group. A remap keyed off tab order
+  // rather than group order would swap the two, and every restored tab would
+  // land in the wrong group with the wrong title and colour.
+  const snap = buildSnapshot(
+    [
+      {
+        window: win(),
+        tabs: [tab({ groupId: 88, active: true }), tab({ url: "https://b.test/", groupId: 77 })],
+        groups: [
+          { id: 77, title: "Research", color: "blue", collapsed: false },
+          { id: 88, title: "Work", color: "red", collapsed: false },
+        ],
+      },
+    ],
+    0,
+  );
+  assert.deepEqual(
+    snap.windows[0].tabs.map((t) => t.groupKey),
+    [1, 0],
+  );
+});
+
 test("a snapshot carries its version and the time it was taken", () => {
   const snap = buildSnapshot(ONE_WINDOW, 123);
   assert.equal(snap.version, SNAPSHOT_VERSION);

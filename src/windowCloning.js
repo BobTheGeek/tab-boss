@@ -1,6 +1,7 @@
 import {
   TAB_GROUP_ID_NONE,
   createAbortWatch,
+  installAbortTracking,
   resolveSourceWindowId,
 } from "./state.js";
 import { windowStillOpen, writeTabs } from "./tabWriter.js";
@@ -219,11 +220,5 @@ export function installWindowCloning(api, state) {
     { windowTypes: ["normal"] },
   );
 
-  api.windows.onRemoved.addListener((windowId) => {
-    // Only in-flight clone targets are recorded. Remembering every window the
-    // user ever closed would leak for the life of the service worker, and the
-    // clone clears its own id as it unwinds.
-    if (!state.suppressedWindowIds.has(windowId)) return;
-    state.abortedWindowIds.add(windowId);
-  });
+  installAbortTracking(api, state);
 }

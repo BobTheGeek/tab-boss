@@ -12,7 +12,9 @@ const state = createState();
 installFocusTracking(chrome, state);
 installNewTabPlacement(chrome, state);
 installWindowCloning(chrome, state);
-installSnapshotScheduler(chrome);
+// The scheduler takes the shared state so a capture can refuse while a restore
+// is halfway through building windows.
+void installSnapshotScheduler(chrome, state);
 installRestore(chrome, state);
 
 void seedFocus(chrome, state);
