@@ -110,6 +110,34 @@ async function buildGroups(api, watch, targetId, written, groups) {
 }
 
 /**
+ * One tab to write. `groupKey` is a number matching some `groups[].key`, or
+ * `null` for an ungrouped tab. It must be `null` and not `0` or `-1`: the
+ * grouping check is `spec.groupKey == null`, so any other value is treated as a
+ * real key and the tab is grouped.
+ *
+ * @typedef {object} TabSpec
+ * @property {string} url          Absolute URL. One an extension may not reopen
+ *                                 is skipped — see `isClonableUrl`.
+ * @property {boolean} pinned
+ * @property {boolean} muted
+ * @property {boolean} active      At most one spec in a plan should set this.
+ * @property {number|null} groupKey
+ */
+
+/**
+ * One group to rebuild. `key` is an opaque identifier private to a single
+ * `writeTabs` call — NOT a Chromium group id. It is compared to `spec.groupKey`
+ * with `Map` lookup, so the types must match exactly: numeric keys against
+ * numeric `groupKey`s. String keys against numeric ones silently match nothing.
+ *
+ * @typedef {object} GroupSpec
+ * @property {number} key
+ * @property {string} title
+ * @property {string} color        A chrome.tabGroups.Color value.
+ * @property {boolean} collapsed
+ */
+
+/**
  * Writes a normalised tab plan into one window.
  *
  * Ordering is load-bearing: create, then mute, then group, then activate, then
@@ -124,6 +152,24 @@ async function buildGroups(api, watch, targetId, written, groups) {
  * the failures and pressing on is what crashed the browser in tb-084.
  *
  * Makes no calls against any window other than `targetId`.
+ *
+ * `plan` and `groups` are coupled: every `plan[].groupKey` that is not `null`
+ * should name a `groups[].key`. Neither direction is validated, and both
+ * mismatches fail silently rather than throwing:
+ *  - a `groupKey` naming no group leaves that tab ungrouped;
+ *  - a group whose key matches no *written* tab is dropped without a call. That
+ *    is deliberate — a group whose tabs were all unclonable has nothing to hold,
+ *    and Chromium rejects an empty `tabs.group` — but it is also what a caller
+ *    sees when its keys simply do not line up, with no error and no log.
+ *
+ * @param {object} api            The chrome API.
+ * @param {{aborted: () => boolean, mark: () => void}} watch  See createAbortWatch.
+ * @param {number} targetId       The window to write into. The only one touched.
+ * @param {TabSpec[]} plan        Written in order, so index 0 lands leftmost.
+ * @param {GroupSpec[]} groups    Rebuilt in order. May be empty.
+ * @returns {Promise<Array<{spec: TabSpec, tab: object}>>} One entry per tab
+ *   actually created, in plan order. Short of `plan.length` when tabs were
+ *   skipped as unclonable, or when the write unwound on an abort.
  */
 export async function writeTabs(api, watch, targetId, plan, groups) {
   const written = [];

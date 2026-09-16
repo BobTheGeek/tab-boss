@@ -213,6 +213,20 @@ test("the blank placeholder tab is removed", async () => {
   assert.equal(fake.tabs.has(20), false);
 });
 
+test("a refused discard still ends with the placeholder removed", async () => {
+  // The writer swallows a refused discard and carries on; this is the cloner's
+  // half of that — the write still counts as having written, so the blank tab
+  // it replaced is still tidied away.
+  const { fake, state } = setupClonable();
+  fake.api.tabs.discard = async () => {
+    throw new Error("cannot discard");
+  };
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(cloned, true);
+  assert.equal(clonedTabs(fake, 2).length, 2);
+  assert.equal(fake.tabs.has(20), false);
+});
+
 test("a still-loading source tab is cloned from its pending URL", async () => {
   const fake = createFakeChrome({
     windows: [{ id: 1 }, { id: 2 }],

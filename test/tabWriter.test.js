@@ -119,9 +119,9 @@ test("unclonable tabs are skipped and the rest still write", async () => {
   plan[0].active = false;
   plan[1].active = true;
 
-  const logs = [];
+  // The skipped-tab log is asserted by the next test; silenced here.
   const originalLog = console.log;
-  console.log = (...args) => logs.push(args);
+  console.log = () => {};
   let written;
   try {
     written = await write(fake, watch, plan);
