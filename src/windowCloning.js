@@ -3,6 +3,11 @@ import {
   createAbortWatch,
   resolveSourceWindowId,
 } from "./state.js";
+import { writeTabs } from "./tabWriter.js";
+
+// The scheme test lives with the writer that applies it, and is re-exported
+// here so existing importers of windowCloning keep working.
+export { isClonableUrl } from "./tabWriter.js";
 
 /** Exact URLs a brand new empty window may show. */
 export const BLANK_TAB_URLS = ["", "about:blank"];
@@ -42,181 +47,66 @@ async function windowStillOpen(api, windowId) {
   }
 }
 
-/** Schemes Chromium forbids an extension from opening in a new tab. */
-const UNCLONABLE_PREFIXES = [
-  "about:",
-  "chrome://",
-  "chrome-untrusted://",
-  "devtools://",
-  "edge://",
-  "ego://",
-  "file://",
-  "view-source:",
-];
-
-/** The one `about:` URL an extension is allowed to reopen. */
-const CLONABLE_ABOUT_URL = "about:blank";
-
-export function isClonableUrl(url) {
-  if (!url) return false;
-  if (url === CLONABLE_ABOUT_URL) return true;
-  return !UNCLONABLE_PREFIXES.some((prefix) => url.startsWith(prefix));
-}
-
-/** Runs a best-effort browser call whose failure must not stop the clone. */
-async function ignoreFailure(promise) {
-  try {
-    await promise;
-  } catch {
-    // Best effort only.
-  }
-}
-
 /**
- * Rebuilds each source group in the target window.
+ * Reads the source window and describes it as a plan the writer can replay.
  *
- * Collapsed state is NOT applied here. Chromium refuses to collapse a group
- * holding the active tab, so the caller applies it after activation and lets
- * the browser refuse where it must.
+ * Every call here is against the SOURCE window, so it cannot hurt the target.
+ * The watch is still consulted, because there is no point reading a source for
+ * a target that has already gone.
  *
- * `watch.aborted()` reports that the target window has been closed. It is
- * checked before every call because a call into a destroyed window's tab strip
- * is not merely useless: it can trip a CHECK in the browser process and take
- * the whole browser down with it.
- *
- * Returns Array<{ newGroupId, collapsed }>.
+ * Returns { plan, groups } or null when the read was abandoned.
  */
-async function recreateGroups(api, targetId, pairs, watch) {
-  const cloneIdsBySourceGroup = new Map();
-  for (const { source, clone } of pairs) {
-    const groupId = source.groupId;
-    if (groupId == null || groupId === TAB_GROUP_ID_NONE) continue;
-    if (!cloneIdsBySourceGroup.has(groupId)) {
-      cloneIdsBySourceGroup.set(groupId, []);
-    }
-    cloneIdsBySourceGroup.get(groupId).push(clone.id);
-  }
+async function planFromWindow(api, sourceId, watch) {
+  // Reached when the removal event arrived during the gate but the window was
+  // still queryable, so the caller's liveness probe said "alive" and only the
+  // armed watch knows better.
+  if (watch.aborted()) return null;
+  const sourceTabs = (await api.tabs.query({ windowId: sourceId })).sort(
+    (a, b) => a.index - b.index,
+  );
 
-  const created = [];
-  // One group vanishing is worth a line. A user closing the window while four
-  // groups are pending is not worth four.
+  const groupKeyBySourceId = new Map();
+  const groups = [];
   let warned = false;
 
-  for (const [sourceGroupId, tabIds] of cloneIdsBySourceGroup) {
-    if (watch.aborted()) return created;
+  for (const tab of sourceTabs) {
+    const groupId = tab.groupId;
+    if (groupId == null || groupId === TAB_GROUP_ID_NONE) continue;
+    if (groupKeyBySourceId.has(groupId)) continue;
+    if (watch.aborted()) return null;
     try {
-      const sourceGroup = await api.tabGroups.get(sourceGroupId);
-      if (watch.aborted()) return created;
-      const newGroupId = await api.tabs.group({
-        tabIds,
-        createProperties: { windowId: targetId },
+      const group = await api.tabGroups.get(groupId);
+      const key = groups.length;
+      groupKeyBySourceId.set(groupId, key);
+      groups.push({
+        key,
+        title: group.title,
+        color: group.color,
+        collapsed: group.collapsed,
       });
-      if (watch.aborted()) return created;
-      await api.tabGroups.update(newGroupId, {
-        title: sourceGroup.title,
-        color: sourceGroup.color,
-      });
-      created.push({ newGroupId, collapsed: sourceGroup.collapsed });
     } catch (error) {
-      if (watch.aborted()) return created;
-      // A rejection here may be the first news that the window has gone,
-      // arriving ahead of windows.onRemoved. Falling through to the next
-      // group would dispatch another tabs.group into a tab strip we have
-      // already watched die, which is the call most likely to trip a CHECK.
-      if (!(await windowStillOpen(api, targetId))) {
-        watch.mark();
-        return created;
-      }
-      // The window is fine, so this really was just one bad group.
+      // One group vanishing is worth a line. A user closing the source while
+      // four groups are pending is not worth four.
       if (!warned) {
         warned = true;
         console.warn("[Tab Boss] could not recreate a tab group", error);
       }
     }
   }
-  return created;
-}
 
-/**
- * Recreates the source window's tabs in the target window.
- *
- * Ordering matters: tabs are created, then muted, then the right one is
- * activated, and only then are the rest unloaded. Discarding before activating
- * would fight the browser, which refuses to discard the active tab.
- *
- * This is five to twenty sequential calls into one window, and the user may
- * close that window at any await. `watch.aborted()` says the window has gone;
- * it is checked before every single call, and the copy then unwinds
- * immediately and silently with whatever pairs it had built. Swallowing the
- * failures instead — as `ignoreFailure` does for a one-off refusal — would
- * keep firing calls at a destroyed window, which is what crashed the browser.
- */
-async function copyTabs(api, sourceId, targetId, watch) {
-  // Reached when the removal event arrived during the gate but the window was
-  // still queryable, so the caller's liveness probe said "alive" and only the
-  // armed watch knows better.
-  if (watch.aborted()) return [];
-  const sourceTabs = (await api.tabs.query({ windowId: sourceId })).sort(
-    (a, b) => a.index - b.index,
-  );
-
-  const pairs = [];
-  let skipped = 0;
-
-  for (const source of sourceTabs) {
-    if (watch.aborted()) return pairs;
+  const plan = sourceTabs.map((tab) => ({
     // A tab whose navigation has not committed reports an empty url and
     // carries its destination in pendingUrl, exactly as isBlankTab assumes.
-    const url = source.url || source.pendingUrl || "";
-    if (!isClonableUrl(url)) {
-      skipped += 1;
-      continue;
-    }
-    const clone = await api.tabs.create({
-      windowId: targetId,
-      url,
-      pinned: source.pinned,
-      active: false,
-    });
-    pairs.push({ source, clone });
-  }
+    url: tab.url || tab.pendingUrl || "",
+    pinned: tab.pinned,
+    muted: Boolean(tab.mutedInfo?.muted),
+    active: Boolean(tab.active),
+    groupKey: groupKeyBySourceId.has(tab.groupId)
+      ? groupKeyBySourceId.get(tab.groupId)
+      : null,
+  }));
 
-  if (skipped > 0 && !watch.aborted()) {
-    // Routine: a pinned chrome:// tab would warn on every single Cmd+N. An
-    // abort says nothing at all, and the create loop can exit normally on its
-    // last tab with the window already gone, so this needs its own check.
-    console.log(
-      `[Tab Boss] skipped ${skipped} tab(s) the browser will not let an extension reopen`,
-    );
-  }
-
-  for (const { source, clone } of pairs) {
-    if (!source.mutedInfo?.muted) continue;
-    if (watch.aborted()) return pairs;
-    await ignoreFailure(api.tabs.update(clone.id, { muted: true }));
-  }
-
-  const groups = await recreateGroups(api, targetId, pairs, watch);
-
-  const activePair = pairs.find(({ source }) => source.active);
-  if (activePair) {
-    if (watch.aborted()) return pairs;
-    await ignoreFailure(api.tabs.update(activePair.clone.id, { active: true }));
-  }
-
-  for (const { newGroupId, collapsed } of groups) {
-    if (!collapsed) continue;
-    if (watch.aborted()) return pairs;
-    await ignoreFailure(api.tabGroups.update(newGroupId, { collapsed: true }));
-  }
-
-  for (const { clone } of pairs) {
-    if (clone.id === activePair?.clone.id) continue;
-    if (watch.aborted()) return pairs;
-    await ignoreFailure(api.tabs.discard(clone.id));
-  }
-
-  return pairs;
+  return { plan, groups };
 }
 
 /**
@@ -289,14 +179,22 @@ export async function cloneIntoWindow(api, state, newWindow) {
     }
 
     try {
-      const pairs = await copyTabs(api, source.id, newWindow.id, watch);
+      const described = await planFromWindow(api, source.id, watch);
+      if (watch.aborted() || described === null) return false;
+      const written = await writeTabs(
+        api,
+        watch,
+        newWindow.id,
+        described.plan,
+        described.groups,
+      );
       // The placeholder belongs to a window that no longer exists, so there is
       // nothing to tidy up and nothing safe to call.
       if (watch.aborted()) return false;
       // Removing a window's last tab closes the window. If every source tab
       // was unclonable there is nothing to replace the placeholder with, so
       // leave a plain empty window rather than making the new window vanish.
-      if (pairs.length > 0) {
+      if (written.length > 0) {
         await api.tabs.remove(placeholder.id);
       }
     } catch (error) {
