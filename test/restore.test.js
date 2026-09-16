@@ -403,6 +403,45 @@ test("a second restore while one is in flight does nothing", async () => {
   );
 });
 
+test("two clicks landing during the snapshot read cannot both start a restore", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      { focused: false, groups: [], tabs: [tabSpec("https://a.test/", { active: true })] },
+      { focused: true, groups: [], tabs: [tabSpec("https://b.test/", { active: true })] },
+    ]),
+  );
+
+  // Hold the snapshot read open so both clicks are still inside it. This is
+  // the window the bail alone does not close: only setting the flag in the
+  // same tick as the check does.
+  const get = fake.api.storage.local.get;
+  fake.api.storage.local.get = async (keys) => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return get(keys);
+  };
+
+  const [first, second] = await Promise.all([
+    restoreNewest(fake.api, state),
+    restoreNewest(fake.api, state),
+  ]);
+
+  assert.deepEqual(
+    [first, second],
+    [2, 0],
+    "state.restoreInProgress must be set in the same tick as the check that guards it: " +
+      "with the assignment left below the snapshot read, both clicks get past the check " +
+      "and the loser's finally clears the flag under the winner",
+  );
+  assert.equal(
+    createdWindowIds(fake).length,
+    2,
+    "a two-window snapshot must yield two windows however many times it is clicked",
+  );
+});
+
 test("a created window that is not a lone placeholder is left intact", async () => {
   const fake = createFakeChrome();
   const state = createState();
