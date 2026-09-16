@@ -266,7 +266,10 @@ export async function cloneIntoWindow(api, state, newWindow) {
       // to run this, which rejects the gate's very first call. Left alone that
       // escapes into the listener as an unhandled rejection: noise on an
       // expected race. Silent if the window has gone, findable if it has not.
-      if (await windowStillOpen(api, newWindow.id)) {
+      // The watch is consulted first because a window whose removal has been
+      // announced can still answer a query for a moment, and the probe would
+      // call that routine close a failure.
+      if (!watch.aborted() && (await windowStillOpen(api, newWindow.id))) {
         console.warn("[Tab Boss] clone failed", error);
       }
       return false;

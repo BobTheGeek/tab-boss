@@ -897,6 +897,44 @@ test("a window closed before the gate can even query it is a silent no-op", asyn
   assert.equal(state.abortedWindowIds.size, 0);
 });
 
+test("a gate query that fails after the removal was announced is silent", async () => {
+  // The tab strip is already gone, so the query rejects, but the window object
+  // still answers for a moment — so the probe would say "alive" and call a
+  // routine Cmd+W a failure. The watch already knows better.
+  const { fake, state } = setupThreeTabSource();
+  const query = fake.api.tabs.query;
+  fake.api.tabs.query = async ({ windowId }) => {
+    if (windowId === 2) {
+      await announceCloseOnly(fake, 2);
+      throw new Error("No tab strip for window 2");
+    }
+    return query({ windowId });
+  };
+
+  const logs = [];
+  const warnings = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args) => logs.push(args);
+  console.warn = (...args) => warnings.push(args);
+  let cloned;
+  try {
+    cloned = await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+
+  assert.equal(cloned, false);
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(logs, []);
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "windows.get"),
+    [],
+    "nothing to ask the browser when the watch already knows",
+  );
+});
+
 test("a gate query that fails with the window still open is a real failure", async () => {
   const { fake, state } = setupThreeTabSource();
   const query = fake.api.tabs.query;
