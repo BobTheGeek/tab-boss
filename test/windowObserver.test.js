@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFakeChrome, createManualClock } from "./fakeChrome.js";
-import { writeMeta } from "../src/snapshotStore.js";
 import {
   FOCUS_GRACE_MS,
   STARTUP_QUIET_MS,
@@ -9,35 +8,78 @@ import {
 import {
   MAX_OBSERVATIONS,
   OBSERVATIONS_KEY,
+  SESSION_START_KEY,
   installWindowObserver,
   readObservations,
 } from "../src/windowObserver.js";
 
 const START = 1_700_000_000_000;
 
+/** Comfortably outside the startup quiet period. */
+const LONG_AGO = START - STARTUP_QUIET_MS - 60_000;
+
 /**
  * The only calls this instrument is allowed to make. The whole point of the
  * exercise is that it observes and writes a log; if this list ever grows a
  * `tabs.` or `windows.` verb, the instrument has become a participant.
+ *
+ * `storage.session.set` is a write, but only of the session marker, and a
+ * separate assertion pins it to that one key.
  */
 const READ_ONLY_CALLS = new Set([
   "tabs.query",
   "windows.get",
   "storage.local.get",
   "storage.local.set",
+  "storage.session.get",
+  "storage.session.set",
 ]);
 
 /**
  * A fake browser with one window already open, plus an observer wired to a
- * hand-driven clock. `browserStartedAt` defaults to well clear of the quiet
- * period, so the default scenario is a genuine Cmd+N.
+ * hand-driven clock.
+ *
+ * `sessionStartedAt` seeds `storage.session` BEFORE the observer installs, so
+ * the default is a session that has been running for a while: a genuine Cmd+N.
+ * Passing `null` leaves session storage empty, which is what the browser hands
+ * a worker on the first start after a restart.
+ *
+ * `startedAt` seeds `meta.browserStartedAt` in `storage.local` separately. It
+ * no longer decides anything — it is recorded so we can check that the session
+ * marker is catching the staleness it was introduced to catch.
+ *
+ * Both are seeded straight into the fake's backing maps rather than through
+ * the api, so `calls` holds only what the observer itself did — including what
+ * it did at install, which is where the session marker is claimed.
+ *
+ * Exactly one observer per fake. `createEvent` in the fake awaits each
+ * listener in turn, and this listener parks on a grace timer, so a second
+ * observer on the same fake would never be reached before the test advanced
+ * the clock. That is a fake artefact, but installing two live observers into
+ * one browser is not a real scenario either: MV3 evicts the old worker before
+ * cold-starting the new one.
  */
-async function setup(t, { startedAt = START - STARTUP_QUIET_MS - 60_000 } = {}) {
+async function setup(
+  t,
+  {
+    sessionStartedAt = LONG_AGO,
+    startedAt = LONG_AGO,
+    breakSessionStorage = false,
+  } = {},
+) {
   const fake = createFakeChrome({
     windows: [{ id: 1 }],
     tabs: [{ id: 100, windowId: 1, index: 0, url: "https://example.com/" }],
   });
-  if (startedAt !== null) await writeMeta(fake.api, { browserStartedAt: startedAt });
+  if (startedAt !== null) fake.storage.set("meta", { browserStartedAt: startedAt });
+  if (sessionStartedAt !== null) {
+    fake.session.set(SESSION_START_KEY, sessionStartedAt);
+  }
+  if (breakSessionStorage) {
+    fake.api.storage.session.get = async () => {
+      throw new Error("session storage unavailable");
+    };
+  }
 
   // The observer logs a line per record. Captured rather than printed, both to
   // keep the suite readable and so the live-watching line can be asserted on.
@@ -53,9 +95,12 @@ async function setup(t, { startedAt = START - STARTUP_QUIET_MS - 60_000 } = {}) 
     now: clock.now,
     wait: clock.wait,
   });
-  fake.calls.length = 0;
   return { ...fake, clock, observer, logs };
 }
+
+/** How many times the observer wrote to a storage area. */
+const setCalls = (fake, area) =>
+  fake.calls.filter(([name]) => name === `storage.${area}.set`);
 
 /** Adds a blank one-tab window to the fake and returns the event object. */
 function openBlankWindow(fake, id, overrides = {}) {
@@ -113,7 +158,8 @@ test("the record carries every signal the classifier was given", async (t) => {
   assert.equal(record.focusedAtCreate, true);
   assert.equal(record.tabCount, 1);
   assert.deepEqual(record.tabUrls, ["chrome://newtab/"]);
-  assert.equal(record.msSinceBrowserStart, STARTUP_QUIET_MS + 60_000);
+  assert.equal(record.sessionStartedAt, LONG_AGO);
+  assert.equal(record.msSinceSessionStart, STARTUP_QUIET_MS + 60_000);
   assert.equal(record.windowsCreatedInLastTwoSeconds, 1);
   assert.equal(record.becameFocused, true);
   assert.equal(record.becameFocusedWithinMs, 30);
@@ -122,6 +168,45 @@ test("the record carries every signal the classifier was given", async (t) => {
   // Kept for the tb-dup lead: the gate and the failure disagreed about the
   // window's type, so the type after the grace period is worth having.
   assert.equal(record.typeAfterGrace, "normal");
+  // Kept so we can check that storage.session behaves on ego lite the way the
+  // docs say. Recorded, not decisive.
+  assert.equal(record.browserStartedAt, LONG_AGO);
+  assert.equal(record.msSinceBrowserStart, STARTUP_QUIET_MS + 60_000);
+  assert.equal(record.startupSeenAt, null);
+});
+
+test("the record reads as a timeline, not as epoch arithmetic", async (t) => {
+  // Concern 2 lives or dies on someone being able to scan this log and tell a
+  // launch storm from one window in the middle of the afternoon.
+  const fake = await setup(t);
+  await observeWindow(fake, openBlankWindow(fake, 2));
+  fake.clock.advance(240_000);
+  await observeWindow(fake, openBlankWindow(fake, 3));
+
+  const log = await readObservations(fake.api);
+  assert.equal(log[0].at, new Date(START).toISOString());
+  assert.equal(log[0].msSincePreviousWindow, null, "the first window has no gap");
+  assert.equal(
+    log[1].msSincePreviousWindow,
+    240_431,
+    "a four-minute gap must be readable without subtracting timestamps",
+  );
+});
+
+test("a storm is visible in the record as a run of tiny gaps", async (t) => {
+  const fake = await setup(t, { sessionStartedAt: START - 1_000 });
+  for (let i = 0; i < 5; i += 1) {
+    void fake.api.windows.onCreated.emit(openBlankWindow(fake, 60 + i));
+    fake.clock.advance(45);
+  }
+  fake.clock.advance(FOCUS_GRACE_MS + 1);
+  await fake.observer.idle();
+
+  const log = await readObservations(fake.api);
+  assert.deepEqual(
+    log.map((record) => record.msSincePreviousWindow),
+    [null, 45, 45, 45, 45],
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -173,7 +258,7 @@ test("the observer leaves the snapshots and meta keys alone", async (t) => {
 test("a Space-restore storm is logged in full and cloned not at all", async (t) => {
   // Twenty windows inside a second, moments after launch, all but one of them
   // rebuilt behind the Space the user was last looking at.
-  const fake = await setup(t, { startedAt: START - 1_000 });
+  const fake = await setup(t, { sessionStartedAt: START - 1_000, startedAt: START - 1_000 });
   const created = [];
   for (let i = 0; i < 20; i += 1) {
     const win = openBlankWindow(fake, 10 + i);
@@ -202,7 +287,7 @@ test("a Space-restore storm is logged in full and cloned not at all", async (t) 
 });
 
 test("a genuine Cmd+N during a storm is logged as refused", async (t) => {
-  const fake = await setup(t, { startedAt: START - 1_000 });
+  const fake = await setup(t, { sessionStartedAt: START - 1_000, startedAt: START - 1_000 });
   for (let i = 0; i < 5; i += 1) {
     void fake.api.windows.onCreated.emit(openBlankWindow(fake, 20 + i));
     fake.clock.advance(50);
@@ -318,24 +403,138 @@ test("focus from long before the create event does not count", async (t) => {
   assert.equal(record.wouldClone, false);
 });
 
-test("an unknown browserStartedAt is logged as null and refused", async (t) => {
-  const fake = await setup(t, { startedAt: null });
+test("a window created inside the quiet period is refused", async (t) => {
+  const fake = await setup(t, { sessionStartedAt: START - 5_000 });
   await observeWindow(fake, openBlankWindow(fake, 2));
 
   const [record] = await readObservations(fake.api);
-  assert.equal(record.browserStartedAt, null);
-  assert.equal(record.msSinceBrowserStart, null);
-  assert.equal(record.wouldClone, false, "a missing start time must not pass");
-  assert.ok(record.reasons.includes("no:msSinceBrowserStart-unknown"));
+  assert.equal(record.msSinceSessionStart, 5_000);
+  assert.equal(record.wouldClone, false);
 });
 
-test("a window created inside the quiet period is refused", async (t) => {
-  const fake = await setup(t, { startedAt: START - 5_000 });
+// ---------------------------------------------------------------------------
+// The session marker — the fix for a browserStartedAt that outlives its
+// browser. See src/windowObserver.js SESSION_START_KEY.
+// ---------------------------------------------------------------------------
+
+test("a fresh session claims the marker and puts its windows inside the quiet period", async (t) => {
+  // storage.session empty is what the browser hands the first worker after a
+  // restart. The observer claims the marker at install, so every window of the
+  // restore storm is measured against a start time of right now.
+  const fake = await setup(t, { sessionStartedAt: null });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  assert.equal(
+    fake.session.get(SESSION_START_KEY),
+    START,
+    "the first worker start since the browser came up must claim the marker",
+  );
+
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.sessionStartedAt, START);
+  assert.equal(record.msSinceSessionStart, 0);
+  assert.equal(record.wouldClone, false);
+  assert.ok(record.reasons.includes("no:startup-quiet=0ms"));
+});
+
+test("a session marker two hours old puts its windows outside the quiet period", async (t) => {
+  const fake = await setup(t, { sessionStartedAt: START - 7_200_000 });
   await observeWindow(fake, openBlankWindow(fake, 2));
 
   const [record] = await readObservations(fake.api);
-  assert.equal(record.msSinceBrowserStart, 5_000);
+  assert.equal(record.msSinceSessionStart, 7_200_000);
+  assert.equal(record.wouldClone, true, record.reasons.join(" "));
+});
+
+test("a browserStartedAt that outlived its browser no longer passes the quiet period", async (t) => {
+  // THE BUG. `meta.browserStartedAt` lives in storage.local and survives a
+  // restart, so a Space storm that beats runtime.onStartup reads the previous
+  // session's timestamp — here, three hours ago. Keyed off that value,
+  // condition 3 would sail through at the one moment it exists to fire.
+  // Keyed off the session marker, it fires.
+  const fake = await setup(t, {
+    sessionStartedAt: null,
+    startedAt: START - 10_800_000,
+  });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  const [record] = await readObservations(fake.api);
+  assert.equal(
+    record.msSinceBrowserStart,
+    10_800_000,
+    "the stale local timestamp is still recorded, so we can see it happening",
+  );
+  assert.equal(record.startupSeenAt, null, "onStartup has not run yet");
+  assert.equal(record.msSinceSessionStart, 0);
+  assert.equal(
+    record.wouldClone,
+    false,
+    "a three-hour-old timestamp from a dead browser must not unlock cloning",
+  );
+});
+
+test("a cold start that finds the marker leaves it exactly where it was", async (t) => {
+  // storage.session survives worker eviction and is cleared only when the
+  // browser shuts down, so a cold start mid-session finds the previous
+  // worker's marker. Manifest V3 evicts this worker constantly, so if an
+  // install could re-claim the marker, every eviction would reset the quiet
+  // period and the restore-storm guard would be off more often than on.
+  const fake = await setup(t, { sessionStartedAt: START - 300_000 });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  assert.equal(fake.session.get(SESSION_START_KEY), START - 300_000);
+  assert.equal(
+    setCalls(fake, "session").length,
+    0,
+    "an install that found a marker must not write one",
+  );
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.sessionStartedAt, START - 300_000);
+  assert.equal(record.msSinceSessionStart, 300_000);
+  assert.equal(record.wouldClone, true, record.reasons.join(" "));
+});
+
+test("an unreadable session marker is a no, not a yes", async (t) => {
+  const fake = await setup(t, { breakSessionStorage: true });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.sessionStartedAt, null);
+  assert.equal(record.msSinceSessionStart, null);
   assert.equal(record.wouldClone, false);
+  assert.ok(record.reasons.includes("no:sessionStart-unknown"));
+});
+
+test("a session marker claim is attempted again after a storage failure", async (t) => {
+  // One transient failure must not blind the quiet period for the whole life
+  // of the worker.
+  const fake = await setup(t, { breakSessionStorage: true });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+  assert.equal((await readObservations(fake.api))[0].sessionStartedAt, null);
+
+  fake.api.storage.session.get = async (keys) => {
+    fake.calls.push(["storage.session.get", keys]);
+    return fake.session.has(keys) ? { [keys]: fake.session.get(keys) } : {};
+  };
+  fake.clock.advance(3_000);
+  await observeWindow(fake, openBlankWindow(fake, 3));
+
+  const record = (await readObservations(fake.api)).at(-1);
+  assert.equal(
+    record.sessionStartedAt,
+    LONG_AGO,
+    "the observer must retry rather than stay blind for the worker's lifetime",
+  );
+});
+
+test("the session marker is the only thing ever written to session storage", async (t) => {
+  const fake = await setup(t, { sessionStartedAt: null });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  const writes = setCalls(fake, "session");
+  assert.equal(writes.length, 1, "claimed once, at install, and never again");
+  assert.deepEqual(Object.keys(writes[0][1]), [SESSION_START_KEY]);
+  assert.deepEqual([...fake.session.keys()], [SESSION_START_KEY]);
 });
 
 test("a tabs.query that fails is recorded as unknown, not as empty", async (t) => {
@@ -427,16 +626,34 @@ test("each record also goes to the console for anyone watching live", async (t) 
   await observeWindow(fake, openBlankWindow(fake, 2));
 
   assert.equal(fake.logs.length, 1, "one compact line per record, no more");
-  const [line] = fake.logs[0];
+  const [summary, json] = fake.logs[0];
   assert.ok(
-    line.startsWith("[Tab Boss dx] "),
-    `observation output must carry the dx prefix, got ${line}`,
+    summary.startsWith("[Tab Boss dx] "),
+    `observation output must carry the dx prefix, got ${summary}`,
   );
+  // The summary leads so a storm is a visible shape in the console.
+  assert.match(summary, /window=2/);
+  assert.match(summary, /WOULD CLONE/);
+  assert.match(summary, /burst=1/);
+  assert.match(summary, /first/);
   assert.equal(
-    JSON.parse(line.slice("[Tab Boss dx] ".length)).windowId,
+    JSON.parse(json).windowId,
     2,
-    "the logged line must be the record itself",
+    "the full record must follow, so the console is replayable too",
   );
+});
+
+test("the console summary says why a storm looks like a storm", async (t) => {
+  const fake = await setup(t, { sessionStartedAt: START - 1_000 });
+  void fake.api.windows.onCreated.emit(openBlankWindow(fake, 2));
+  fake.clock.advance(45);
+  void fake.api.windows.onCreated.emit(openBlankWindow(fake, 3));
+  fake.clock.advance(FOCUS_GRACE_MS + 1);
+  await fake.observer.idle();
+
+  const summaries = fake.logs.map(([summary]) => summary);
+  assert.ok(summaries.every((line) => line.includes("would not clone")));
+  assert.ok(summaries.some((line) => line.includes("burst=2 gap=45ms")));
 });
 
 test("readObservations reads an empty store as no records", async () => {

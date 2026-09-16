@@ -27,6 +27,16 @@ import { isBlankTab } from "./windowCloning.js";
  * session or Space restore rather than a person. This is the constant that
  * kills the restore storm, and the one most likely to need tuning from the
  * log: raise it if restored Spaces are still being classified as Cmd+N.
+ *
+ * It is measured against `msSinceSessionStart`, which the observer derives
+ * from a marker in `chrome.storage.session`. NOT against
+ * `meta.browserStartedAt`: that lives in `storage.local` and therefore
+ * survives a restart, so a Space storm that beat `runtime.onStartup` would
+ * read the PREVIOUS session's timestamp, come out as hours, and leave this
+ * condition inert at exactly the moment it exists to fire. The browser clears
+ * session storage on shutdown, so the reset is a property of the storage area
+ * rather than a race we have to win — the same fix the snapshot scheduler's
+ * loss counter already got, for the same reason.
  */
 export const STARTUP_QUIET_MS = 90_000;
 
@@ -98,14 +108,14 @@ export function classifyWindow(observation) {
     pass("one-blank-tab");
   }
 
-  // 3. Well clear of browser start. This is what kills the Space-restore
-  //    storm. An unknown start time is a veto, not a pass: `null` here means
-  //    we do not know whether the browser just launched, and "do not know"
-  //    resolves to "do not clone".
-  const sinceStart = observation.msSinceBrowserStart;
-  if (!Number.isFinite(sinceStart)) veto("msSinceBrowserStart-unknown");
+  // 3. Well clear of the start of THIS browser session. This is what kills the
+  //    Space-restore storm. An unknown start time is a veto, not a pass:
+  //    `null` here means we do not know whether the browser just launched, and
+  //    "do not know" resolves to "do not clone".
+  const sinceStart = observation.msSinceSessionStart;
+  if (!Number.isFinite(sinceStart)) veto("sessionStart-unknown");
   else if (sinceStart <= STARTUP_QUIET_MS) veto(`startup-quiet=${sinceStart}ms`);
-  else pass(`sinceStart=${sinceStart}ms`);
+  else pass(`sinceSessionStart=${sinceStart}ms`);
 
   // 4. Not part of a burst. The counter includes this window, so a lone
   //    window reads 1. Anything higher is the browser opening windows faster

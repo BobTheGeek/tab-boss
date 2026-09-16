@@ -24,6 +24,24 @@ import { FOCUS_GRACE_MS, BURST_WINDOW_MS, classifyWindow } from "./windowClassif
  */
 export const OBSERVATIONS_KEY = "windowObservations";
 
+/**
+ * Marks the start of the current browser session, in `chrome.storage.session`.
+ *
+ * This is the whole mechanism behind condition 3, and the storage area is the
+ * point. `meta.browserStartedAt` cannot do this job: it lives in
+ * `storage.local`, so it survives a restart, and a Space storm that beats
+ * `runtime.onStartup` reads the PREVIOUS session's timestamp — hours ago —
+ * and sails straight through the startup quiet period at the one moment the
+ * quiet period exists for. `test/snapshotScheduler.test.js` already documents
+ * that exact race for the persisted alarm; the scheduler's loss counter was
+ * moved here to escape it, and so is this.
+ *
+ * The browser clears session storage on shutdown, so "absent" means "first
+ * worker start since the browser came up" as a property of the storage area
+ * rather than as a race we have to win against an event.
+ */
+export const SESSION_START_KEY = "sessionStartedAt";
+
 /** How many records to keep. Oldest dropped first. */
 export const MAX_OBSERVATIONS = 200;
 
@@ -55,6 +73,39 @@ export async function readObservations(api) {
  * *malformed* stored value means we do know, and it is unusable, so starting
  * fresh is correct. Same asymmetry as `appendSnapshot`, for the same reason.
  */
+/**
+ * Reads the session marker, claiming it if this is the first worker start
+ * since the browser came up.
+ *
+ * Get-then-set-if-absent, deliberately not serialised. Manifest V3 evicts and
+ * cold-starts this worker constantly, so `installWindowObserver` runs many
+ * times per session, but only the run that finds the key absent writes it.
+ * Two near-simultaneous cold starts could both find it absent and both write;
+ * that race is harmless, because they would write timestamps milliseconds
+ * apart and the value is only ever compared against a 90-second threshold.
+ *
+ * Fails closed: anything unreadable returns null, condition 3 vetoes, and the
+ * worst case is that the user loses a Cmd+N clone.
+ *
+ * A mid-session claim is possible in two ways — a transient storage failure on
+ * a previous attempt, or an extension reload, which also clears session
+ * storage. Both make the session look brand new and so suppress cloning for
+ * `STARTUP_QUIET_MS`. That is the safe direction, and it is the direction this
+ * whole rule is built to fail in.
+ */
+async function claimSessionStart(api, now) {
+  try {
+    const result = await api.storage.session.get(SESSION_START_KEY);
+    const stored = result?.[SESSION_START_KEY];
+    if (Number.isFinite(stored)) return stored;
+    const startedAt = now();
+    await api.storage.session.set({ [SESSION_START_KEY]: startedAt });
+    return startedAt;
+  } catch {
+    return null;
+  }
+}
+
 async function appendObservation(api, record) {
   const result = await api.storage.local.get(OBSERVATIONS_KEY);
   const stored = result?.[OBSERVATIONS_KEY];
@@ -103,6 +154,27 @@ export function installWindowObserver(api, options = {}) {
    * matters.
    */
   let startupSeenAt = null;
+
+  /** When the previous window was created, so a storm is visible at a glance. */
+  let previousWindowCreatedAt = null;
+
+  /**
+   * Claimed at install, not lazily on the first window, so the marker is
+   * anchored to when the worker came up rather than to whenever the first
+   * window happens to arrive. Kicked off without awaiting, because every
+   * listener below must be registered synchronously at the top level or
+   * Manifest V3 will not wake an evicted worker for the event.
+   *
+   * Re-attempted when it resolves to null, so one transient storage failure
+   * does not blind the quiet period for the whole life of the worker.
+   */
+  let sessionStart = claimSessionStart(api, now);
+  async function readSessionStart() {
+    const startedAt = await sessionStart;
+    if (startedAt !== null) return startedAt;
+    sessionStart = claimSessionStart(api, now);
+    return sessionStart;
+  }
 
   const inFlight = new Set();
 
@@ -156,6 +228,14 @@ export function installWindowObserver(api, options = {}) {
     recentCreations.push(createdAt);
     const windowsCreatedInLastTwoSeconds = recentCreations.length;
 
+    // The gap to the window before it, so a human scanning the log can tell a
+    // launch storm from one window in the middle of the afternoon without
+    // doing arithmetic. A column of 40s is a machine; a lone null or a gap of
+    // minutes is a person.
+    const msSincePreviousWindow =
+      previousWindowCreatedAt === null ? null : createdAt - previousWindowCreatedAt;
+    previousWindowCreatedAt = createdAt;
+
     const pending = { createdAt, focusedAt: null };
     const priorFocus = recentFocus.get(win.id);
     if (priorFocus != null && priorFocus >= createdAt - focusGraceMs) {
@@ -169,7 +249,13 @@ export function installWindowObserver(api, options = {}) {
     // come back.
     const grace = wait(focusGraceMs);
 
-    const task = observe(win, createdAt, windowsCreatedInLastTwoSeconds, pending, grace)
+    const task = observe(win, {
+      createdAt,
+      burst: windowsCreatedInLastTwoSeconds,
+      msSincePreviousWindow,
+      pending,
+      grace,
+    })
       .catch(() => {
         // An instrument that throws into the browser's event loop is worse
         // than one that misses a record.
@@ -182,7 +268,7 @@ export function installWindowObserver(api, options = {}) {
     return task;
   });
 
-  async function observe(win, createdAt, burst, pending, grace) {
+  async function observe(win, { createdAt, burst, msSincePreviousWindow, pending, grace }) {
     let tabs = null;
     try {
       tabs = await api.tabs.query({ windowId: win.id });
@@ -191,6 +277,15 @@ export function installWindowObserver(api, options = {}) {
       // this. Unknown is recorded as unknown, and the classifier fails closed.
     }
 
+    // The signal condition 3 actually keys off.
+    const sessionStartedAt = await readSessionStart();
+
+    // Still recorded, no longer decisive. These two are how we check whether
+    // storage.session behaves on ego lite the way the docs say it does: a
+    // record with a large `msSinceBrowserStart`, a small `msSinceSessionStart`
+    // and `startupSeenAt: null` is a restart where the local timestamp was
+    // stale and the session marker caught it — which is the bug this rule was
+    // rewritten to close, caught in the act.
     const meta = await readMeta(api);
     const browserStartedAt = Number.isFinite(meta.browserStartedAt)
       ? meta.browserStartedAt
@@ -219,8 +314,8 @@ export function installWindowObserver(api, options = {}) {
           : tabs
               .slice(0, MAX_RECORDED_TAB_URLS)
               .map((tab) => ({ url: tab.url || tab.pendingUrl || "" })),
-      msSinceBrowserStart:
-        browserStartedAt === null ? null : createdAt - browserStartedAt,
+      msSinceSessionStart:
+        sessionStartedAt === null ? null : createdAt - sessionStartedAt,
       windowsCreatedInLastTwoSeconds: burst,
       becameFocusedWithinMs:
         pending.focusedAt === null ? null : pending.focusedAt - createdAt,
@@ -230,8 +325,12 @@ export function installWindowObserver(api, options = {}) {
 
     const record = {
       version: RECORD_VERSION,
+      // Wall clock first, so scanning the log reads as a timeline rather than
+      // as a column of epoch milliseconds.
+      at: new Date(createdAt).toISOString(),
       createdAt,
       recordedAt,
+      msSincePreviousWindow,
       windowId: win.id,
       typeAtCreate: win.type ?? null,
       typeAfterGrace,
@@ -239,9 +338,12 @@ export function installWindowObserver(api, options = {}) {
       focusedAtCreate: win.focused ?? null,
       tabCount: observation.tabCount,
       tabUrls: observation.tabs === null ? [] : observation.tabs.map((t) => t.url),
+      sessionStartedAt,
+      msSinceSessionStart: observation.msSinceSessionStart,
       browserStartedAt,
       startupSeenAt,
-      msSinceBrowserStart: observation.msSinceBrowserStart,
+      msSinceBrowserStart:
+        browserStartedAt === null ? null : createdAt - browserStartedAt,
       windowsCreatedInLastTwoSeconds: burst,
       becameFocused: pending.focusedAt !== null,
       becameFocusedWithinMs: observation.becameFocusedWithinMs,
@@ -252,7 +354,18 @@ export function installWindowObserver(api, options = {}) {
     // A service worker's console dies with the worker, and Manifest V3 evicts
     // it constantly, so this line is a convenience for anyone watching live.
     // The stored log is the record that actually has to survive.
-    console.log(`${LOG_PREFIX} ${JSON.stringify(record)}`);
+    //
+    // The summary leads, so a storm is obvious as a shape in the console —
+    // a run of lines with a rising burst= and a tiny gap= is a machine — and
+    // the full record follows for anyone who wants to read or replay it.
+    const gap =
+      msSincePreviousWindow === null ? "first" : `gap=${msSincePreviousWindow}ms`;
+    console.log(
+      `${LOG_PREFIX} ${record.at} window=${win.id} ${
+        wouldClone ? "WOULD CLONE" : "would not clone"
+      } burst=${burst} ${gap}`,
+      JSON.stringify(record),
+    );
 
     await enqueueWrite(async () => {
       try {

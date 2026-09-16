@@ -17,7 +17,7 @@ const cmdN = (overrides = {}) => ({
   incognito: false,
   tabCount: 1,
   tabs: [{ url: "chrome://newtab/" }],
-  msSinceBrowserStart: STARTUP_QUIET_MS + 60_000,
+  msSinceSessionStart: STARTUP_QUIET_MS + 60_000,
   windowsCreatedInLastTwoSeconds: 1,
   becameFocusedWithinMs: 40,
   ...overrides,
@@ -43,7 +43,7 @@ test("a yes records why, not just that", () => {
   assert.deepEqual(reasons, [
     "ok:normal-window",
     "ok:one-blank-tab",
-    `ok:sinceStart=${STARTUP_QUIET_MS + 60_000}ms`,
+    `ok:sinceSessionStart=${STARTUP_QUIET_MS + 60_000}ms`,
     "ok:no-burst",
     "ok:focused-in=40ms",
   ]);
@@ -95,18 +95,18 @@ test("2. every blank form the cloner accepts is accepted here too", () => {
 });
 
 test("3. a window created inside the startup quiet period is never cloned", () => {
-  assertVetoedBy(cmdN({ msSinceBrowserStart: 0 }), "startup-quiet");
+  assertVetoedBy(cmdN({ msSinceSessionStart: 0 }), "startup-quiet");
   assertVetoedBy(
-    cmdN({ msSinceBrowserStart: STARTUP_QUIET_MS - 1 }),
+    cmdN({ msSinceSessionStart: STARTUP_QUIET_MS - 1 }),
     "startup-quiet",
   );
   // The boundary is exclusive: exactly at the threshold is still quiet.
   assertVetoedBy(
-    cmdN({ msSinceBrowserStart: STARTUP_QUIET_MS }),
+    cmdN({ msSinceSessionStart: STARTUP_QUIET_MS }),
     "startup-quiet",
   );
   assert.equal(
-    classifyWindow(cmdN({ msSinceBrowserStart: STARTUP_QUIET_MS + 1 }))
+    classifyWindow(cmdN({ msSinceSessionStart: STARTUP_QUIET_MS + 1 }))
       .wouldClone,
     true,
   );
@@ -149,16 +149,16 @@ test("5. focus delivered just before the create event still counts", () => {
 // Failing closed.
 // ---------------------------------------------------------------------------
 
-test("a missing browserStartedAt is a no, not a yes", () => {
-  assertVetoedBy(cmdN({ msSinceBrowserStart: null }), "msSinceBrowserStart");
+test("a missing session start is a no, not a yes", () => {
+  assertVetoedBy(cmdN({ msSinceSessionStart: null }), "sessionStart-unknown");
   assertVetoedBy(
-    cmdN({ msSinceBrowserStart: undefined }),
-    "msSinceBrowserStart",
+    cmdN({ msSinceSessionStart: undefined }),
+    "sessionStart-unknown",
   );
-  assertVetoedBy(cmdN({ msSinceBrowserStart: NaN }), "msSinceBrowserStart");
+  assertVetoedBy(cmdN({ msSinceSessionStart: NaN }), "sessionStart-unknown");
   assertVetoedBy(
-    cmdN({ msSinceBrowserStart: "90001" }),
-    "msSinceBrowserStart",
+    cmdN({ msSinceSessionStart: "90001" }),
+    "sessionStart-unknown",
   );
 });
 
@@ -206,7 +206,7 @@ test("a Space-restore storm is rejected window by window", () => {
   for (let i = 0; i < 20; i += 1) {
     storm.push(
       cmdN({
-        msSinceBrowserStart: 1_200 + i * 45,
+        msSinceSessionStart: 1_200 + i * 45,
         windowsCreatedInLastTwoSeconds: i + 1,
         becameFocusedWithinMs: i === 7 ? 30 : null,
       }),
@@ -236,7 +236,7 @@ test("a genuine Cmd+N arriving during a storm is still refused", () => {
   // a real clone the user does not get, and that is the correct trade: one
   // missed Cmd+N against ten clone windows and 350 duplicate tabs.
   assertVetoedBy(
-    cmdN({ msSinceBrowserStart: 3_000, windowsCreatedInLastTwoSeconds: 6 }),
+    cmdN({ msSinceSessionStart: 3_000, windowsCreatedInLastTwoSeconds: 6 }),
     "startup-quiet",
   );
 });
