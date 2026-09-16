@@ -69,15 +69,36 @@ async function ignoreFailure(promise) {
 }
 
 /**
+ * One clone's view of "has the window I am filling gone away?".
+ *
+ * `aborted()` is checked before every call. `mark()` exists because the news
+ * can reach us two ways: windows.onRemoved, or a rejection that proves the
+ * window has gone before the event arrives. Chromium does not promise which
+ * of those two messages lands first, so whichever wins marks the window and
+ * every later phase stops.
+ */
+function createAbortWatch(state, windowId) {
+  return {
+    aborted: () => state.abortedWindowIds.has(windowId),
+    mark: () => state.abortedWindowIds.add(windowId),
+  };
+}
+
+/**
  * Rebuilds each source group in the target window.
  *
  * Collapsed state is NOT applied here. Chromium refuses to collapse a group
  * holding the active tab, so the caller applies it after activation and lets
  * the browser refuse where it must.
  *
+ * `watch.aborted()` reports that the target window has been closed. It is
+ * checked before every call because a call into a destroyed window's tab strip
+ * is not merely useless: it can trip a CHECK in the browser process and take
+ * the whole browser down with it.
+ *
  * Returns Array<{ newGroupId, collapsed }>.
  */
-async function recreateGroups(api, targetId, pairs) {
+async function recreateGroups(api, targetId, pairs, watch) {
   const cloneIdsBySourceGroup = new Map();
   for (const { source, clone } of pairs) {
     const groupId = source.groupId;
@@ -89,20 +110,40 @@ async function recreateGroups(api, targetId, pairs) {
   }
 
   const created = [];
+  // One group vanishing is worth a line. A user closing the window while four
+  // groups are pending is not worth four.
+  let warned = false;
+
   for (const [sourceGroupId, tabIds] of cloneIdsBySourceGroup) {
+    if (watch.aborted()) return created;
     try {
       const sourceGroup = await api.tabGroups.get(sourceGroupId);
+      if (watch.aborted()) return created;
       const newGroupId = await api.tabs.group({
         tabIds,
         createProperties: { windowId: targetId },
       });
+      if (watch.aborted()) return created;
       await api.tabGroups.update(newGroupId, {
         title: sourceGroup.title,
         color: sourceGroup.color,
       });
       created.push({ newGroupId, collapsed: sourceGroup.collapsed });
     } catch (error) {
-      console.warn("[Tab Boss] could not recreate a tab group", error);
+      if (watch.aborted()) return created;
+      // A rejection here may be the first news that the window has gone,
+      // arriving ahead of windows.onRemoved. Falling through to the next
+      // group would dispatch another tabs.group into a tab strip we have
+      // already watched die, which is the call most likely to trip a CHECK.
+      if (!(await windowStillOpen(api, targetId))) {
+        watch.mark();
+        return created;
+      }
+      // The window is fine, so this really was just one bad group.
+      if (!warned) {
+        warned = true;
+        console.warn("[Tab Boss] could not recreate a tab group", error);
+      }
     }
   }
   return created;
@@ -114,8 +155,19 @@ async function recreateGroups(api, targetId, pairs) {
  * Ordering matters: tabs are created, then muted, then the right one is
  * activated, and only then are the rest unloaded. Discarding before activating
  * would fight the browser, which refuses to discard the active tab.
+ *
+ * This is five to twenty sequential calls into one window, and the user may
+ * close that window at any await. `watch.aborted()` says the window has gone;
+ * it is checked before every single call, and the copy then unwinds
+ * immediately and silently with whatever pairs it had built. Swallowing the
+ * failures instead — as `ignoreFailure` does for a one-off refusal — would
+ * keep firing calls at a destroyed window, which is what crashed the browser.
  */
-async function copyTabs(api, sourceId, targetId) {
+async function copyTabs(api, sourceId, targetId, watch) {
+  // Reached when the removal event arrived during the gate but the window was
+  // still queryable, so the caller's liveness probe said "alive" and only the
+  // armed watch knows better.
+  if (watch.aborted()) return [];
   const sourceTabs = (await api.tabs.query({ windowId: sourceId })).sort(
     (a, b) => a.index - b.index,
   );
@@ -124,6 +176,7 @@ async function copyTabs(api, sourceId, targetId) {
   let skipped = 0;
 
   for (const source of sourceTabs) {
+    if (watch.aborted()) return pairs;
     // A tab whose navigation has not committed reports an empty url and
     // carries its destination in pendingUrl, exactly as isBlankTab assumes.
     const url = source.url || source.pendingUrl || "";
@@ -140,33 +193,38 @@ async function copyTabs(api, sourceId, targetId) {
     pairs.push({ source, clone });
   }
 
-  if (skipped > 0) {
-    // Routine: a pinned chrome:// tab would warn on every single Cmd+N.
+  if (skipped > 0 && !watch.aborted()) {
+    // Routine: a pinned chrome:// tab would warn on every single Cmd+N. An
+    // abort says nothing at all, and the create loop can exit normally on its
+    // last tab with the window already gone, so this needs its own check.
     console.log(
       `[Tab Boss] skipped ${skipped} tab(s) the browser will not let an extension reopen`,
     );
   }
 
   for (const { source, clone } of pairs) {
-    if (source.mutedInfo?.muted) {
-      await ignoreFailure(api.tabs.update(clone.id, { muted: true }));
-    }
+    if (!source.mutedInfo?.muted) continue;
+    if (watch.aborted()) return pairs;
+    await ignoreFailure(api.tabs.update(clone.id, { muted: true }));
   }
 
-  const groups = await recreateGroups(api, targetId, pairs);
+  const groups = await recreateGroups(api, targetId, pairs, watch);
 
   const activePair = pairs.find(({ source }) => source.active);
   if (activePair) {
+    if (watch.aborted()) return pairs;
     await ignoreFailure(api.tabs.update(activePair.clone.id, { active: true }));
   }
 
   for (const { newGroupId, collapsed } of groups) {
     if (!collapsed) continue;
+    if (watch.aborted()) return pairs;
     await ignoreFailure(api.tabGroups.update(newGroupId, { collapsed: true }));
   }
 
   for (const { clone } of pairs) {
     if (clone.id === activePair?.clone.id) continue;
+    if (watch.aborted()) return pairs;
     await ignoreFailure(api.tabs.discard(clone.id));
   }
 
@@ -191,52 +249,102 @@ export async function cloneIntoWindow(api, state, newWindow) {
   if (newWindow.incognito) return false;
   if (newWindow.type !== "normal") return false;
 
-  const newTabs = await api.tabs.query({ windowId: newWindow.id });
-  if (newTabs.length !== 1) return false;
-  if (!isBlankTab(newTabs[0])) return false;
-  const placeholder = newTabs[0];
-
-  if (sourceId == null || sourceId === newWindow.id) return false;
-  // A window still being filled by the cloner holds no meaningful contents
-  // yet, so cloning it would copy a half-built window.
-  if (state.suppressedWindowIds.has(sourceId)) return false;
-
-  let source;
-  try {
-    source = await api.windows.get(sourceId);
-  } catch {
-    return false;
-  }
-  if (!isCloneSource(source)) return false;
-
+  // Armed before the first await, because windows.onRemoved only records a
+  // window that is already an in-flight clone target. Arming any later would
+  // drop a close that lands during the gate — the likeliest moment of all for
+  // a reflexive Cmd+N, Cmd+W — and leave every guard below reading false.
+  // The cost is that new tab placement skips this window's first tab, which is
+  // a no-op: it is the only tab in a one-tab window.
   state.suppressedWindowIds.add(newWindow.id);
+  const watch = createAbortWatch(state, newWindow.id);
   try {
-    const pairs = await copyTabs(api, source.id, newWindow.id);
-    // Removing a window's last tab closes the window. If every source tab was
-    // unclonable there is nothing to replace the placeholder with, so leave a
-    // plain empty window rather than making the new window vanish.
-    if (pairs.length > 0) {
-      await api.tabs.remove(placeholder.id);
+    let newTabs;
+    try {
+      newTabs = await api.tabs.query({ windowId: newWindow.id });
+    } catch (error) {
+      // The window can be closed before the service worker is even scheduled
+      // to run this, which rejects the gate's very first call. Left alone that
+      // escapes into the listener as an unhandled rejection: noise on an
+      // expected race. Silent if the window has gone, findable if it has not.
+      // The watch is consulted first because a window whose removal has been
+      // announced can still answer a query for a moment, and the probe would
+      // call that routine close a failure.
+      if (!watch.aborted() && (await windowStillOpen(api, newWindow.id))) {
+        console.warn("[Tab Boss] clone failed", error);
+      }
+      return false;
     }
-  } catch (error) {
-    // The user can close the new window mid-clone, which fails every pending
-    // call. That is an expected race and stays silent. Anything else is a real
-    // failure and must be findable in the service worker console.
-    if (await windowStillOpen(api, newWindow.id)) {
-      console.warn("[Tab Boss] clone failed", error);
+    if (newTabs.length !== 1) return false;
+    if (!isBlankTab(newTabs[0])) return false;
+    const placeholder = newTabs[0];
+
+    if (sourceId == null || sourceId === newWindow.id) return false;
+    // A window still being filled by the cloner holds no meaningful contents
+    // yet, so cloning it would copy a half-built window. The line above has
+    // already ruled out this window's own entry.
+    if (state.suppressedWindowIds.has(sourceId)) return false;
+
+    let source;
+    try {
+      source = await api.windows.get(sourceId);
+    } catch {
+      return false;
     }
-    return false;
+    if (!isCloneSource(source)) return false;
+
+    // The watch cannot see a close that landed before it was armed, and an
+    // event can always be slower than we are. One read-only probe, here,
+    // before the first mutating call, is the belt to that braces.
+    if (!(await windowStillOpen(api, newWindow.id))) {
+      watch.mark();
+      return false;
+    }
+
+    try {
+      const pairs = await copyTabs(api, source.id, newWindow.id, watch);
+      // The placeholder belongs to a window that no longer exists, so there is
+      // nothing to tidy up and nothing safe to call.
+      if (watch.aborted()) return false;
+      // Removing a window's last tab closes the window. If every source tab
+      // was unclonable there is nothing to replace the placeholder with, so
+      // leave a plain empty window rather than making the new window vanish.
+      if (pairs.length > 0) {
+        await api.tabs.remove(placeholder.id);
+      }
+    } catch (error) {
+      // The user can close the new window mid-clone, which fails every pending
+      // call. That is an expected race and stays silent. Anything else is a
+      // real failure and must be findable in the service worker console. When
+      // the window's death is already known, we do not ask the browser again.
+      if (!watch.aborted() && (await windowStillOpen(api, newWindow.id))) {
+        console.warn("[Tab Boss] clone failed", error);
+      }
+      return false;
+    }
+    return true;
   } finally {
+    // Every exit from the gate, including a thrown one, unwinds through here.
     state.suppressedWindowIds.delete(newWindow.id);
+    state.abortedWindowIds.delete(newWindow.id);
   }
-  return true;
 }
 
 export function installWindowCloning(api, state) {
+  // Manifest V3 will not wake an evicted service worker for a listener that
+  // was registered inside an awaited callback, so both registrations stay
+  // synchronous at the top level of the installer.
   api.windows.onCreated.addListener(
     async (win) => {
       await cloneIntoWindow(api, state, win);
     },
     { windowTypes: ["normal"] },
   );
+
+  api.windows.onRemoved.addListener((windowId) => {
+    // Only in-flight clone targets are recorded. Remembering every window the
+    // user ever closed would leak for the life of the service worker, and the
+    // clone clears its own id as it unwinds.
+    if (!state.suppressedWindowIds.has(windowId)) return;
+    state.abortedWindowIds.add(windowId);
+  });
 }
