@@ -35,6 +35,7 @@ export function createFakeChrome(initial = {}) {
   const tabs = new Map();
   const groups = new Map();
   const storage = new Map();
+  const session = new Map();
   const alarms = new Map();
   const calls = [];
   const badge = { text: "" };
@@ -60,6 +61,31 @@ export function createFakeChrome(initial = {}) {
     const tab = tabs.get(tabId);
     if (!tab) throw new Error(`No tab with id ${tabId}`);
     return tab;
+  }
+
+  /** One chrome.storage area. `name` keeps the recorded call names exact. */
+  function createStorageArea(name, backing) {
+    return {
+      async get(keys) {
+        calls.push([`storage.${name}.get`, keys]);
+        const wanted = Array.isArray(keys) ? keys : [keys];
+        const out = {};
+        for (const key of wanted) {
+          if (backing.has(key)) out[key] = structuredClone(backing.get(key));
+        }
+        return out;
+      },
+      async set(items) {
+        calls.push([`storage.${name}.set`, items]);
+        for (const [key, value] of Object.entries(items)) {
+          backing.set(key, structuredClone(value));
+        }
+      },
+      async clear() {
+        calls.push([`storage.${name}.clear`]);
+        backing.clear();
+      },
+    };
   }
 
   const api = {
@@ -245,25 +271,14 @@ export function createFakeChrome(initial = {}) {
     },
 
     storage: {
-      local: {
-        async get(keys) {
-          calls.push(["storage.local.get", keys]);
-          const wanted = Array.isArray(keys) ? keys : [keys];
-          const out = {};
-          for (const key of wanted) {
-            if (storage.has(key)) out[key] = structuredClone(storage.get(key));
-          }
-          return out;
-        },
-        async set(items) {
-          calls.push(["storage.local.set", items]);
-          for (const [key, value] of Object.entries(items)) {
-            storage.set(key, structuredClone(value));
-          }
-        },
-      },
+      local: createStorageArea("local", storage),
+      // A separate backing map, because the real areas have different
+      // lifetimes: the browser clears session storage on shutdown and keeps
+      // local across restarts. A test simulates a browser restart by clearing
+      // the session map and leaving the local one alone.
+      session: createStorageArea("session", session),
     },
   };
 
-  return { api, calls, tabs, windows, groups, storage, alarms, badge };
+  return { api, calls, tabs, windows, groups, storage, session, alarms, badge };
 }

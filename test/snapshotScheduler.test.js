@@ -2,7 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createFakeChrome } from "./fakeChrome.js";
 import { createState } from "../src/state.js";
-import { newestSnapshot, readMeta, readSnapshots, writeMeta } from "../src/snapshotStore.js";
+import {
+  newestSnapshot,
+  readConsecutiveLosses,
+  readMeta,
+  readSnapshots,
+  writeConsecutiveLosses,
+  writeMeta,
+} from "../src/snapshotStore.js";
 import { totalTabs } from "../src/snapshot.js";
 import {
   MAX_CONSECUTIVE_LOSSES,
@@ -36,7 +43,7 @@ test("a capture outside the quiet period is saved", async () => {
 test("a capture inside the quiet period is skipped", async () => {
   const { api } = fakeWith(3);
   const state = createState();
-  await writeMeta(api, { browserStartedAt: 1000, consecutiveSuspectedLosses: 0 });
+  await writeMeta(api, { browserStartedAt: 1000 });
   assert.equal(await captureNow(api, 1000 + QUIET_PERIOD_MS - 1, state), "quiet");
   assert.deepEqual(await readSnapshots(api), []);
 });
@@ -44,7 +51,7 @@ test("a capture inside the quiet period is skipped", async () => {
 test("a capture just past the quiet period is saved", async () => {
   const { api } = fakeWith(3);
   const state = createState();
-  await writeMeta(api, { browserStartedAt: 1000, consecutiveSuspectedLosses: 0 });
+  await writeMeta(api, { browserStartedAt: 1000 });
   assert.equal(await captureNow(api, 1000 + QUIET_PERIOD_MS, state), "saved");
 });
 
@@ -68,7 +75,7 @@ test("a halved tab count is skipped as a suspected loss and counted", async () =
   assert.equal(await captureNow(api, 0, state), "saved");
   for (const id of [...tabs.keys()].slice(4)) tabs.delete(id);
   assert.equal(await captureNow(api, 1, state), "loss");
-  assert.equal((await readMeta(api)).consecutiveSuspectedLosses, 1);
+  assert.equal(await readConsecutiveLosses(api), 1);
   assert.equal((await readSnapshots(api)).length, 1);
 });
 
@@ -81,16 +88,17 @@ test("a persistent low count is accepted on the third try and resets the counter
     assert.equal(await captureNow(api, i, state), "loss");
   }
   assert.equal(await captureNow(api, MAX_CONSECUTIVE_LOSSES, state), "saved");
-  assert.equal((await readMeta(api)).consecutiveSuspectedLosses, 0);
+  assert.equal(await readConsecutiveLosses(api), 0);
   assert.equal((await readSnapshots(api)).length, 2);
 });
 
 test("a successful save resets the loss counter", async () => {
   const { api } = fakeWith(3);
   const state = createState();
-  await writeMeta(api, { browserStartedAt: null, consecutiveSuspectedLosses: 2 });
+  await writeMeta(api, { browserStartedAt: null });
+  await writeConsecutiveLosses(api, 2);
   assert.equal(await captureNow(api, 0, state), "saved");
-  assert.equal((await readMeta(api)).consecutiveSuspectedLosses, 0);
+  assert.equal(await readConsecutiveLosses(api), 0);
 });
 
 test("the first ever capture cannot be a loss or unchanged", async () => {
@@ -187,35 +195,98 @@ test("a browser start landing mid-capture survives the capture's own meta write"
   );
 });
 
-test("a browser start clears the loss counter, so a post-crash remnant cannot be saved at once", async () => {
-  // Ten tabs of good history, and the counter happens to be sitting at two
-  // when the browser goes down.
-  const { api, tabs } = fakeWith(10);
+/**
+ * Ends a browser session the way the browser does: storage.local survives, so
+ * `meta.browserStartedAt` still holds the OLD session's value, and
+ * storage.session is cleared. Then the machine comes back up holding `tabs`
+ * worth of tabs.
+ */
+async function restartBrowserInto(fake, tabCount) {
+  fake.session.clear();
+  for (const id of [...fake.tabs.keys()].slice(tabCount)) fake.tabs.delete(id);
+}
+
+/** Runs `n` captures that are each expected to be refused as a loss. */
+async function accumulateStrikes(api, state, n) {
+  for (let i = 0; i < n; i += 1) {
+    assert.equal(await captureNow(api, 1_000_000 + i, state), "loss");
+  }
+}
+
+test("an alarm that fires before onStartup cannot save a halved candidate", async () => {
+  // Ten tabs of good history, and the counter ends the session sitting at two.
+  const fake = fakeWith(10);
+  const { api } = fake;
+  const state = createState();
+  await installSnapshotScheduler(api, state);
+  await writeMeta(api, { browserStartedAt: 1_000 });
+  await captureNow(api, 500_000, state);
+  for (const id of [...fake.tabs.keys()].slice(4)) fake.tabs.delete(id);
+  await accumulateStrikes(api, state, MAX_CONSECUTIVE_LOSSES - 1);
+  assert.equal(await readConsecutiveLosses(api), MAX_CONSECUTIVE_LOSSES - 1);
+
+  // Crash, relaunch into a single tab. The persisted overdue alarm fires
+  // BEFORE runtime.onStartup, so browserStartedAt is still the previous
+  // session's value and the quiet period is bypassed. Before the counter moved
+  // to storage.session, that left the escape hatch as the only thing standing
+  // in the way — and it was already at two, so it fired on the very first
+  // capture of the new session and the remnant became the newest snapshot.
+  await restartBrowserInto(fake, 1);
+  await api.alarms.onAlarm.emit({ name: SNAPSHOT_ALARM });
+
+  assert.equal(
+    totalTabs(await newestSnapshot(api)),
+    10,
+    "a counter that outlives the browser collapses the six-minute buffer to nothing",
+  );
+});
+
+test("a restart clears the loss counter even when onStartup runs first", async () => {
+  const fake = fakeWith(10);
+  const { api } = fake;
   const state = createState();
   await installSnapshotScheduler(api, state);
   await captureNow(api, 0, state);
-  await writeMeta(api, {
-    browserStartedAt: null,
-    consecutiveSuspectedLosses: MAX_CONSECUTIVE_LOSSES - 1,
-  });
+  for (const id of [...fake.tabs.keys()].slice(4)) fake.tabs.delete(id);
+  await accumulateStrikes(api, state, MAX_CONSECUTIVE_LOSSES - 1);
 
-  // The browser crashes and relaunches into a single tab.
-  for (const id of [...tabs.keys()].slice(1)) tabs.delete(id);
+  await restartBrowserInto(fake, 1);
   await api.runtime.onStartup.emit();
 
   const { browserStartedAt } = await readMeta(api);
   // Past the quiet period, so only the loss counter stands between the remnant
-  // and the newest snapshot. A fresh session is not a continuation of
-  // yesterday's evidence that the user meant to close half their tabs.
+  // and the newest snapshot. Both event orderings land here, because the reset
+  // is a property of the storage area rather than of the event.
   assert.equal(
     await captureNow(api, browserStartedAt + QUIET_PERIOD_MS, state),
     "loss",
   );
-  assert.equal(
-    totalTabs(await newestSnapshot(api)),
-    10,
-    "a counter carried over the restart collapses the six-minute buffer to nothing and the remnant becomes the newest snapshot",
-  );
+  assert.equal(totalTabs(await newestSnapshot(api)), 10);
+});
+
+test("the loss counter accumulates across ticks and survives a worker eviction", async () => {
+  // Moving storage areas must not break the behaviour the escape hatch exists
+  // for: a user who genuinely closes half their tabs still gets a snapshot
+  // after about six minutes.
+  const fake = fakeWith(10);
+  const { api } = fake;
+  const state = createState();
+  await installSnapshotScheduler(api, state);
+  await captureNow(api, 0, state);
+  for (const id of [...fake.tabs.keys()].slice(4)) fake.tabs.delete(id);
+
+  assert.equal(await captureNow(api, 1, state), "loss");
+  assert.equal(await readConsecutiveLosses(api), 1);
+
+  // Manifest V3 evicts the worker between two-minute ticks and background.js
+  // re-runs. storage.session survives that, unlike anything held in memory.
+  await installSnapshotScheduler(api, createState());
+
+  assert.equal(await captureNow(api, 2, state), "loss");
+  assert.equal(await readConsecutiveLosses(api), MAX_CONSECUTIVE_LOSSES - 1);
+  assert.equal(await captureNow(api, 3, state), "saved");
+  assert.equal(await readConsecutiveLosses(api), 0, "a successful save resets the counter");
+  assert.equal(totalTabs(await newestSnapshot(api)), 4, "the low count is accepted on the third strike");
 });
 
 test("no snapshot is taken while a restore is in flight", async () => {
@@ -259,7 +330,7 @@ test("a restore beginning mid-capture does not spend a suspected-loss strike", a
 
   assert.equal(await captureNow(api, 1, state), "restoring");
   assert.equal(
-    (await readMeta(api)).consecutiveSuspectedLosses,
+    await readConsecutiveLosses(api),
     0,
     "the counter is a write too: a reading of the browser that was never real must not spend a strike towards the escape hatch",
   );

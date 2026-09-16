@@ -2,8 +2,10 @@ import { buildSnapshot, fingerprint, isSuspectedLoss, totalTabs } from "./snapsh
 import {
   appendSnapshot,
   newestSnapshot,
+  readConsecutiveLosses,
   readMeta,
   updateMeta,
+  writeConsecutiveLosses,
 } from "./snapshotStore.js";
 
 export const SNAPSHOT_ALARM = "tab-boss-snapshot";
@@ -65,6 +67,9 @@ export async function captureNow(api, now, state) {
 
   const candidate = buildSnapshot(await readCapturableWindows(api), now);
   const newest = await newestSnapshot(api);
+  // Read up here, with the other reads, so the restore check below stays
+  // immediately adjacent to the writes it guards.
+  const seenSoFar = await readConsecutiveLosses(api);
 
   // Re-checked after the last read and before any write, with no await in the
   // gap. The check at the top cannot see a toolbar click that landed while the
@@ -78,16 +83,13 @@ export async function captureNow(api, now, state) {
     if (fingerprint(candidate) === fingerprint(newest)) return "unchanged";
 
     if (isSuspectedLoss(candidate, newest)) {
-      const seen = meta.consecutiveSuspectedLosses + 1;
+      const seen = seenSoFar + 1;
       if (seen < MAX_CONSECUTIVE_LOSSES) {
         // Routine, not a failure: say why a snapshot is missing.
         console.log(
           `[Tab Boss] skipped a snapshot: ${totalTabs(candidate)} tabs, down from ${totalTabs(newest)}`,
         );
-        // Only the counter. browserStartedAt belongs to recordStart, and a
-        // whole-object write here would put back the value read before the
-        // several awaits above.
-        await updateMeta(api, { consecutiveSuspectedLosses: seen });
+        await writeConsecutiveLosses(api, seen);
         return "loss";
       }
       // The low count has held long enough to be a decision, not a loss.
@@ -95,7 +97,7 @@ export async function captureNow(api, now, state) {
   }
 
   await appendSnapshot(api, candidate);
-  await updateMeta(api, { consecutiveSuspectedLosses: 0 });
+  await writeConsecutiveLosses(api, 0);
   return "saved";
 }
 
@@ -141,23 +143,12 @@ export function installSnapshotScheduler(api, state) {
   });
 
   const recordStart = async () => {
-    // The counter is reset alongside the clock. A fresh browser session is not
-    // a continuation of yesterday's evidence that the user deliberately closed
-    // half their tabs, and a counter carried across a restart would let the
-    // very first capture of the new session take the escape hatch and make a
-    // post-crash remnant the newest snapshot.
-    //
-    // KNOWN GAP: this only helps once onStartup has actually run. A persisted
-    // alarm that is already overdue can fire first, and a capture at that
-    // moment still sees the previous session's counter and the previous
-    // session's browserStartedAt — so it bypasses the quiet period and can
-    // take the escape hatch immediately. Closing that needs the counter held
-    // somewhere the browser clears on restart by itself, such as
-    // chrome.storage.session, rather than a reset that races the alarm.
-    await updateMeta(api, {
-      browserStartedAt: Date.now(),
-      consecutiveSuspectedLosses: 0,
-    });
+    // Only the clock. The suspected-loss counter is NOT reset here: it lives in
+    // chrome.storage.session, which the browser has already cleared by the time
+    // this runs. Resetting it here as well would be a second mechanism for the
+    // same thing, and a strictly worse one — it only works if onStartup wins
+    // the race against a persisted overdue alarm, and it does not always.
+    await updateMeta(api, { browserStartedAt: Date.now() });
   };
 
   api.runtime.onStartup.addListener(recordStart);
