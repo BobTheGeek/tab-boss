@@ -23,8 +23,19 @@ scroll position, unsubmitted form input, or media playback position. Cloned
 tabs start fresh. You stay signed in to sites, because cookies are shared
 across windows of the same profile.
 
-Tabs on `chrome://`, `devtools://`, and `file://` URLs cannot be reopened by an
-extension and are skipped, with a count logged to the service worker console.
+Tabs whose URL an extension is not allowed to reopen are skipped, with a count
+logged to the service worker console. That covers `about:` (except
+`about:blank`), `chrome://`, `chrome-untrusted://`, `devtools://`, `edge://`,
+`ego://`, and `view-source:` URLs, and `file://` URLs. If a window holds
+nothing but such tabs — a lone `chrome://extensions` tab, say — the new window
+is simply left empty.
+
+### The first Cmd+N after a long idle
+
+The extension keeps no stored state. When the browser has been idle long
+enough for Chromium to shut its service worker down, the very first Cmd+N can
+land before the extension has re-learned which window you came from, and that
+window opens empty. A second Cmd+N clones as usual.
 
 ## Install
 
