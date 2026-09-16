@@ -71,3 +71,57 @@ test("a malformed meta value reads as the defaults", async () => {
     consecutiveSuspectedLosses: 0,
   });
 });
+
+test("a storage failure during append aborts without ever calling storage.local.set", async () => {
+  const { api, calls, storage } = createFakeChrome();
+  storage.set("snapshots", [snap(1), snap(2)]);
+  api.storage.local.get = async () => {
+    throw new Error("storage unavailable");
+  };
+  await assert.rejects(() => appendSnapshot(api, snap(3)));
+  assert.equal(
+    calls.some(([name]) => name === "storage.local.set"),
+    false,
+  );
+});
+
+test("a storage failure during append leaves existing snapshots intact", async () => {
+  const { api, storage } = createFakeChrome();
+  storage.set("snapshots", [snap(1), snap(2)]);
+  const originalGet = api.storage.local.get;
+  api.storage.local.get = async () => {
+    throw new Error("storage unavailable");
+  };
+  await assert.rejects(() => appendSnapshot(api, snap(3)));
+  api.storage.local.get = originalGet;
+  assert.deepEqual((await readSnapshots(api)).map((s) => s.takenAt), [1, 2]);
+});
+
+test("a malformed stored value during append still succeeds, starting fresh", async () => {
+  const { api, storage } = createFakeChrome();
+  storage.set("snapshots", { not: "an array" });
+  await appendSnapshot(api, snap(1));
+  assert.deepEqual((await readSnapshots(api)).map((s) => s.takenAt), [1]);
+});
+
+test("mutating a snapshot returned from readSnapshots does not corrupt the store", async () => {
+  const { api } = createFakeChrome();
+  await appendSnapshot(api, snap(1));
+  const [first] = await readSnapshots(api);
+  first.takenAt = 999;
+  first.windows.push("mutated");
+  const [again] = await readSnapshots(api);
+  assert.equal(again.takenAt, 1);
+  assert.deepEqual(again.windows, []);
+});
+
+test("mutating a snapshot after it is passed to appendSnapshot does not corrupt the store", async () => {
+  const { api } = createFakeChrome();
+  const original = snap(1);
+  await appendSnapshot(api, original);
+  original.takenAt = 999;
+  original.windows.push("mutated");
+  const [stored] = await readSnapshots(api);
+  assert.equal(stored.takenAt, 1);
+  assert.deepEqual(stored.windows, []);
+});

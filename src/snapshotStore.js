@@ -33,8 +33,24 @@ export async function newestSnapshot(api) {
   return snapshots.length > 0 ? snapshots.at(-1) : null;
 }
 
+/**
+ * Reads without swallowing, for the one caller that must not write on a
+ * guess. A rejection here aborts the append: overwriting real history with a
+ * single snapshot because one read glitched is worse than skipping a save.
+ *
+ * Note the asymmetry with readSnapshots: a *rejected* read means we do not
+ * know what is stored, so appendSnapshot must not write at all. A
+ * *malformed* stored value means we do know, and it is unusable, so there is
+ * no history to protect and starting fresh is correct.
+ */
+async function readSnapshotsForWrite(api) {
+  const result = await api.storage.local.get(SNAPSHOTS_KEY);
+  const stored = result?.[SNAPSHOTS_KEY];
+  return Array.isArray(stored) ? stored : [];
+}
+
 export async function appendSnapshot(api, snapshot) {
-  const snapshots = await readSnapshots(api);
+  const snapshots = await readSnapshotsForWrite(api);
   snapshots.push(snapshot);
   await api.storage.local.set({
     [SNAPSHOTS_KEY]: snapshots.slice(-MAX_SNAPSHOTS),
