@@ -19,6 +19,20 @@ export function isClonableUrl(url) {
   return !UNCLONABLE_PREFIXES.some((prefix) => url.startsWith(prefix));
 }
 
+/**
+ * Distinguishes an expected race from an unexpected failure. If the window has
+ * gone, the user closed it mid-write and every pending call was always going to
+ * fail — that is not worth logging.
+ */
+export async function windowStillOpen(api, windowId) {
+  try {
+    await api.windows.get(windowId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Runs a best-effort browser call whose failure must not stop the write. */
 async function ignoreFailure(promise) {
   try {
@@ -40,6 +54,10 @@ async function ignoreFailure(promise) {
  * is not merely useless: it can trip a CHECK in the browser process and take
  * the whole browser down with it.
  *
+ * A group that fails while the window is open is one bad group, not a dead
+ * window: it is skipped and the write carries on, because a user who loses one
+ * group's title is far better off than a user who loses every tab.
+ *
  * Returns Array<{ newGroupId, collapsed }>.
  */
 async function buildGroups(api, watch, targetId, written, groups) {
@@ -51,20 +69,42 @@ async function buildGroups(api, watch, targetId, written, groups) {
   }
 
   const created = [];
+  // One group vanishing is worth a line. A user closing the window while four
+  // groups are pending is not worth four.
+  let warned = false;
+
   for (const group of groups) {
     const tabIds = tabIdsByKey.get(group.key);
     if (!tabIds || tabIds.length === 0) continue;
     if (watch.aborted()) return created;
-    const newGroupId = await api.tabs.group({
-      tabIds,
-      createProperties: { windowId: targetId },
-    });
-    if (watch.aborted()) return created;
-    await api.tabGroups.update(newGroupId, {
-      title: group.title,
-      color: group.color,
-    });
-    created.push({ newGroupId, collapsed: group.collapsed });
+    try {
+      const newGroupId = await api.tabs.group({
+        tabIds,
+        createProperties: { windowId: targetId },
+      });
+      if (watch.aborted()) return created;
+      await api.tabGroups.update(newGroupId, {
+        title: group.title,
+        color: group.color,
+      });
+      created.push({ newGroupId, collapsed: group.collapsed });
+    } catch (error) {
+      if (watch.aborted()) return created;
+      // A rejection here may be the first news that the window has gone,
+      // arriving ahead of windows.onRemoved. Falling through to the next
+      // group would dispatch another tabs.group into a tab strip we have
+      // already watched die, which is the call most likely to trip a CHECK.
+      if (!(await windowStillOpen(api, targetId))) {
+        watch.mark();
+        return created;
+      }
+      // The window is fine, so this really was just one bad group. The user
+      // keeps their tabs; only this group is missing.
+      if (!warned) {
+        warned = true;
+        console.warn("[Tab Boss] could not recreate a tab group", error);
+      }
+    }
   }
   return created;
 }

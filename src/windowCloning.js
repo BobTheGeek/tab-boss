@@ -3,7 +3,7 @@ import {
   createAbortWatch,
   resolveSourceWindowId,
 } from "./state.js";
-import { writeTabs } from "./tabWriter.js";
+import { windowStillOpen, writeTabs } from "./tabWriter.js";
 
 // The scheme test lives with the writer that applies it, and is re-exported
 // here so existing importers of windowCloning keep working.
@@ -31,20 +31,6 @@ export function isBlankTab(tab) {
 
 function isCloneSource(win) {
   return win.type === "normal" && !win.incognito;
-}
-
-/**
- * Distinguishes an expected race from an unexpected failure. If the target
- * window has gone, the user closed it mid-clone and every pending call was
- * always going to fail — that is not worth logging.
- */
-async function windowStillOpen(api, windowId) {
-  try {
-    await api.windows.get(windowId);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**

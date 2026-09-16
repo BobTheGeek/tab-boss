@@ -190,6 +190,20 @@ function groupedPlan(groupOverrides = {}) {
   return { plan, groups };
 }
 
+/** Two groups of one tab each, plus one loose active tab. */
+function twoGroupPlan() {
+  const plan = planOf("https://a.test/", "https://b.test/", "https://c.test/");
+  plan[0].active = false;
+  plan[0].groupKey = 0;
+  plan[1].groupKey = 1;
+  plan[2].active = true;
+  const groups = [
+    { key: 0, title: "One", color: "blue", collapsed: false },
+    { key: 1, title: "Two", color: "red", collapsed: false },
+  ];
+  return { plan, groups };
+}
+
 test("grouped tabs land in one new group in the target window", async () => {
   const { fake, watch } = setupTarget();
   const { plan, groups } = groupedPlan();
@@ -279,6 +293,11 @@ test("a group with no written tabs is never created", async () => {
 function closeTarget(fake, state) {
   fake.windows.delete(TARGET_ID);
   state.abortedWindowIds.add(TARGET_ID);
+}
+
+/** Destroys the target without the removal event ever reaching the watch. */
+function destroyTargetSilently(fake) {
+  fake.windows.delete(TARGET_ID);
 }
 
 /** Names of every call recorded after `cut`. */
@@ -373,15 +392,7 @@ test("a window removed before the group phase is never grouped into", async () =
 
 test("a window removed inside the group loop stops the remaining groups", async () => {
   const { fake, state, watch } = setupTarget();
-  const plan = planOf("https://a.test/", "https://b.test/", "https://c.test/");
-  plan[0].active = false;
-  plan[0].groupKey = 0;
-  plan[1].groupKey = 1;
-  plan[2].active = true;
-  const groups = [
-    { key: 0, title: "One", color: "blue", collapsed: false },
-    { key: 1, title: "Two", color: "red", collapsed: false },
-  ];
+  const { plan, groups } = twoGroupPlan();
 
   let cut = null;
   const group = fake.api.tabs.group;
@@ -496,4 +507,127 @@ test("an aborted write logs nothing at all", async () => {
 
   assert.deepEqual(warnings, []);
   assert.deepEqual(logs, []);
+});
+
+// --- A group can fail on its own, or because the window has gone ------------
+//
+// The two cases need opposite answers. One bad group must not cost the user
+// every tab, and a rejection that proves the window has gone must not be
+// followed by another tabs.group into a tab strip already known to be dead.
+
+test("a group that fails with the window open is skipped and the write completes", async () => {
+  const { fake, watch } = setupTarget();
+  const { plan, groups } = groupedPlan();
+  fake.api.tabs.group = async () => {
+    throw new Error("cannot group");
+  };
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  let written;
+  try {
+    written = await write(fake, watch, plan, groups);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0][0], /^\[Tab Boss\] could not recreate/);
+  // A warning is not an abort: losing a group's title must not cost the user
+  // every tab in the window.
+  assert.equal(written.length, 3);
+  assert.equal(writtenTabs(fake).length, 3);
+  const active = writtenTabs(fake).filter((tab) => tab.active);
+  assert.equal(active.length, 1);
+  assert.equal(active[0].url, "https://c.test/");
+  assert.equal(
+    fake.calls.filter(([name]) => name === "tabs.discard").length,
+    2,
+    "the phases after the failed group still run",
+  );
+});
+
+test("a first group failing with the window open does not stop the second", async () => {
+  const { fake, watch } = setupTarget();
+  const { plan, groups } = twoGroupPlan();
+  const group = fake.api.tabs.group;
+  let groupCount = 0;
+  fake.api.tabs.group = async (args) => {
+    groupCount += 1;
+    if (groupCount === 1) throw new Error("cannot group");
+    return group(args);
+  };
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await write(fake, watch, plan, groups);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  // One group vanishing is worth a line; it is still only ever one line.
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0][0], /^\[Tab Boss\] could not recreate/);
+  assert.equal(groupCount, 2, "the second group must still be rebuilt");
+  const [a, b] = writtenTabs(fake);
+  assert.equal(a.groupId, -1);
+  assert.notEqual(b.groupId, -1);
+  assert.equal(fake.groups.get(b.groupId).title, "Two");
+});
+
+test("a group failure that proves the window is gone unwinds the write", async () => {
+  const { fake, state, watch } = setupTarget();
+  const { plan, groups } = twoGroupPlan();
+
+  let cut = null;
+  fake.api.tabs.group = async () => {
+    // The rejection beats windows.onRemoved to us. Falling through to the next
+    // group would dispatch another tabs.group into a tab strip we have already
+    // watched die.
+    destroyTargetSilently(fake);
+    cut = fake.calls.length;
+    throw new Error("window closed");
+  };
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  let written;
+  try {
+    written = await write(fake, watch, plan, groups);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(
+    state.abortedWindowIds.has(TARGET_ID),
+    true,
+    "the failure is the first news of the close, so it must mark the watch",
+  );
+  // The probe that proved it, and nothing else: the mark stops every later
+  // phase too.
+  assert.deepEqual(callsAfter(fake, cut), [["windows.get", TARGET_ID]]);
+  assert.deepEqual(warnings, [], "a closed window is a race, not a failure");
+  assert.equal(written.length, 3, "the write unwinds with what it had written");
+});
+
+test("a group failure on an already-known close does not probe the browser", async () => {
+  const { fake, state, watch } = setupTarget();
+  const { plan, groups } = twoGroupPlan();
+
+  let cut = null;
+  fake.api.tabs.group = async () => {
+    // This time the event wins the race, so the window's death is already
+    // known and there is nothing left to ask the browser.
+    closeTarget(fake, state);
+    cut = fake.calls.length;
+    throw new Error("window closed");
+  };
+
+  await write(fake, watch, plan, groups);
+
+  assert.deepEqual(callsAfter(fake, cut), []);
 });
