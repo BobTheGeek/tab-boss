@@ -1,4 +1,8 @@
-import { TAB_GROUP_ID_NONE, resolveSourceWindowId } from "./state.js";
+import {
+  TAB_GROUP_ID_NONE,
+  createAbortWatch,
+  resolveSourceWindowId,
+} from "./state.js";
 
 /** Exact URLs a brand new empty window may show. */
 export const BLANK_TAB_URLS = ["", "about:blank"];
@@ -66,22 +70,6 @@ async function ignoreFailure(promise) {
   } catch {
     // Best effort only.
   }
-}
-
-/**
- * One clone's view of "has the window I am filling gone away?".
- *
- * `aborted()` is checked before every call. `mark()` exists because the news
- * can reach us two ways: windows.onRemoved, or a rejection that proves the
- * window has gone before the event arrives. Chromium does not promise which
- * of those two messages lands first, so whichever wins marks the window and
- * every later phase stops.
- */
-function createAbortWatch(state, windowId) {
-  return {
-    aborted: () => state.abortedWindowIds.has(windowId),
-    mark: () => state.abortedWindowIds.add(windowId),
-  };
 }
 
 /**

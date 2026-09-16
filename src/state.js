@@ -44,3 +44,21 @@ export function resolveSourceWindowId(state, newWindowId) {
     ? state.currentWindowId
     : state.previousWindowId;
 }
+
+/**
+ * A one-window view of the abort set, so callers ask "has my window gone?"
+ * rather than reaching into shared state. `mark()` is for a caller that learns
+ * the window is gone from a failed call rather than from windows.onRemoved.
+ *
+ * `aborted()` is checked before every call into the window. `mark()` exists
+ * because the news can reach us two ways: windows.onRemoved, or a rejection
+ * that proves the window has gone before the event arrives. Chromium does not
+ * promise which of those two messages lands first, so whichever wins marks the
+ * window and every later phase stops.
+ */
+export function createAbortWatch(state, windowId) {
+  return {
+    aborted: () => state.abortedWindowIds.has(windowId),
+    mark: () => state.abortedWindowIds.add(windowId),
+  };
+}
