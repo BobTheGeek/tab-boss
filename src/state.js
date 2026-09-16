@@ -20,7 +20,12 @@ export const TAB_GROUP_ID_NONE = -1;
  * windows.create, which fires windows.onCreated, which is what the cloner
  * listens for — without this the cloner would clone every restored window.
  * suppressedWindowIds cannot do the job: the id is not known until create
- * resolves, and onCreated can fire first.
+ * resolves, and onCreated can fire first. It is deliberately a single flag and
+ * not a count: a second toolbar click during a restore does nothing, so the
+ * flag has exactly one owner and cannot be lowered out from under it.
+ * It also suppresses a genuine Cmd+N for the length of the restore. That is
+ * the right trade — a restore is brief, and one window that did not clone is a
+ * far smaller loss than a restored window with a clone dumped on top of it.
  */
 export function createState() {
   return {

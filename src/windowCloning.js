@@ -104,7 +104,10 @@ async function planFromWindow(api, sourceId, watch) {
  */
 export async function cloneIntoWindow(api, state, newWindow) {
   // Restore creates windows of its own. Both this check and the flag's setter
-  // are synchronous, so no event can interleave between them.
+  // are synchronous, so no event can interleave between them. This also
+  // ignores a genuine Cmd+N for the length of the restore, which is the right
+  // trade: a restore is brief, and one window that did not clone is a far
+  // smaller loss than a restored window with a clone dumped on top of it.
   if (state.restoreInProgress) return false;
 
   // Resolved before the first await. Any windows.onFocusChanged landing while

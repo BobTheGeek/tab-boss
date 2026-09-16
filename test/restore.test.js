@@ -4,6 +4,7 @@ import { createFakeChrome } from "./fakeChrome.js";
 import { createState } from "../src/state.js";
 import { appendSnapshot } from "../src/snapshotStore.js";
 import { SNAPSHOT_VERSION } from "../src/snapshot.js";
+import { installWindowCloning } from "../src/windowCloning.js";
 import { installRestore, restoreNewest } from "../src/restore.js";
 
 function snapshot(windows) {
@@ -33,20 +34,64 @@ function createdWindowIds(fake) {
 }
 
 /**
- * Runs a restore whose logging is expected and asserted elsewhere, so the
- * suite's own output stays clean. Matches the convention in tabWriter.test.js.
+ * Captures what a restore said, so tests can assert on silence as well as on
+ * content. Matches the convention in tabWriter.test.js.
  */
-async function silently(run) {
+async function recording(run) {
+  const logs = [];
+  const warnings = [];
   const originalLog = console.log;
   const originalWarn = console.warn;
-  console.log = () => {};
-  console.warn = () => {};
+  console.log = (...args) => logs.push(args);
+  console.warn = (...args) => warnings.push(args);
   try {
-    return await run();
+    return { logs, warnings, value: await run() };
   } finally {
     console.log = originalLog;
     console.warn = originalWarn;
   }
+}
+
+/** Runs a restore whose logging is expected and asserted elsewhere. */
+async function silently(run) {
+  return (await recording(run)).value;
+}
+
+/**
+ * Closes a window the way Chromium does — its tabs go with it — and delivers
+ * windows.onRemoved.
+ *
+ * installWindowCloning supplies the only listener that records a close into
+ * state.abortedWindowIds, which is why the tests below install the cloner.
+ * Without it the abort watch restore builds can never fire, and every guard
+ * that depends on it reads false forever.
+ */
+async function closeWindow(fake, windowId) {
+  for (const [id, tab] of [...fake.tabs]) {
+    if (tab.windowId === windowId) fake.tabs.delete(id);
+  }
+  fake.windows.delete(windowId);
+  await fake.api.windows.onRemoved.emit(windowId);
+}
+
+/**
+ * Arranges for the user to close the first restored window the instant its
+ * first tab appears, mid-write. Returns a reader for how many calls the fake
+ * had logged at that moment, so a test can assert on everything that followed.
+ */
+function closeFirstWindowMidWrite(fake, state) {
+  installWindowCloning(fake.api, state);
+  const create = fake.api.tabs.create;
+  let callsAtClose = null;
+  fake.api.tabs.create = async (props) => {
+    const tab = await create(props);
+    if (callsAtClose === null) {
+      await closeWindow(fake, props.windowId);
+      callsAtClose = fake.calls.length;
+    }
+    return tab;
+  };
+  return () => callsAtClose;
 }
 
 test("restoring creates a window with the snapshot's tabs in order", async () => {
@@ -210,6 +255,184 @@ test("restoreInProgress is cleared even when the restore throws", async () => {
   };
   await silently(() => restoreNewest(fake.api, state));
   assert.equal(state.restoreInProgress, false);
+});
+
+const THREE_TABS = snapshot([
+  {
+    focused: true,
+    groups: [],
+    tabs: [
+      tabSpec("https://a.test/"),
+      tabSpec("https://b.test/"),
+      tabSpec("https://c.test/", { active: true }),
+    ],
+  },
+]);
+
+test("a window closed mid-write is never called into again", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(fake.api, THREE_TABS);
+  const callsAtClose = closeFirstWindowMidWrite(fake, state);
+
+  await restoreNewest(fake.api, state);
+
+  assert.notEqual(callsAtClose(), null, "the window must really have closed mid-write");
+  assert.deepEqual(
+    fake.calls.slice(callsAtClose()),
+    [],
+    "a call into a destroyed tab strip can take the whole browser down",
+  );
+});
+
+test("the placeholder of a window closed mid-write is not removed", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(fake.api, THREE_TABS);
+  closeFirstWindowMidWrite(fake, state);
+
+  await restoreNewest(fake.api, state);
+
+  // writeTabs returns the tabs it managed to create even when it unwound on an
+  // abort, so a non-empty result must not be read as "the window survived".
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "tabs.remove"),
+    [],
+  );
+});
+
+test("a window closed mid-write is a silent race that does not stop the rest", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      {
+        focused: false,
+        groups: [],
+        tabs: [tabSpec("https://a.test/"), tabSpec("https://b.test/", { active: true })],
+      },
+      { focused: true, groups: [], tabs: [tabSpec("https://c.test/", { active: true })] },
+    ]),
+  );
+  closeFirstWindowMidWrite(fake, state);
+
+  const { logs, warnings } = await recording(() => restoreNewest(fake.api, state));
+
+  assert.deepEqual(warnings, [], "the user closed it on purpose; that is not a failure");
+  assert.deepEqual(logs, []);
+  const open = createdWindowIds(fake);
+  assert.equal(open.length, 1, "the second window must still be restored");
+  assert.deepEqual(tabsOf(fake, open[0]).map((tab) => tab.url), ["https://c.test/"]);
+});
+
+test("a rejection that beats windows.onRemoved is still a silent race", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      {
+        focused: false,
+        groups: [],
+        tabs: [tabSpec("https://a.test/"), tabSpec("https://b.test/", { active: true })],
+      },
+      { focused: true, groups: [], tabs: [tabSpec("https://c.test/", { active: true })] },
+    ]),
+  );
+  installWindowCloning(fake.api, state);
+
+  const create = fake.api.tabs.create;
+  let gone = null;
+  fake.api.tabs.create = async (props) => {
+    // Chromium does not promise windows.onRemoved arrives before calls into
+    // the window start failing. Here the rejection wins that race, so the
+    // watch has never been armed and only the rejection knows.
+    if (props.windowId === gone) throw new Error(`No window with id ${gone}`);
+    const tab = await create(props);
+    if (gone === null) {
+      gone = props.windowId;
+      for (const [id, existing] of [...fake.tabs]) {
+        if (existing.windowId === gone) fake.tabs.delete(id);
+      }
+      fake.windows.delete(gone);
+    }
+    return tab;
+  };
+
+  const { logs, warnings } = await recording(() => restoreNewest(fake.api, state));
+
+  assert.deepEqual(warnings, [], "a window that has gone is an expected race, not a failure");
+  assert.deepEqual(logs, []);
+  const open = createdWindowIds(fake);
+  assert.equal(open.length, 1, "one window's race must not abandon the others");
+  assert.deepEqual(tabsOf(fake, open[0]).map((tab) => tab.url), ["https://c.test/"]);
+});
+
+test("a second restore while one is in flight does nothing", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      { focused: false, groups: [], tabs: [tabSpec("https://a.test/", { active: true })] },
+      { focused: true, groups: [], tabs: [tabSpec("https://b.test/", { active: true })] },
+    ]),
+  );
+
+  const flagAtEachCreate = [];
+  const create = fake.api.windows.create;
+  let second = null;
+  fake.api.windows.create = async (data) => {
+    const win = await create(data);
+    flagAtEachCreate.push(state.restoreInProgress);
+    // The user clicks the toolbar icon again, mid-restore.
+    if (second === null) second = restoreNewest(fake.api, state);
+    return win;
+  };
+
+  const created = await restoreNewest(fake.api, state);
+
+  assert.equal(await second, 0, "the second click must do nothing");
+  assert.equal(created, 2);
+  assert.equal(createdWindowIds(fake).length, 2, "not one window more than the snapshot");
+  assert.deepEqual(
+    flagAtEachCreate,
+    [true, true],
+    "the guard must never drop while windows are still being made",
+  );
+});
+
+test("a created window that is not a lone placeholder is left intact", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(fake.api, TWO_TABS);
+  const create = fake.api.windows.create;
+  fake.api.windows.create = async (data) => {
+    const win = await create(data);
+    // A window that came up holding more than the one blank tab is not ours
+    // to tidy, so nothing in it may be closed.
+    fake.tabs.set(9000, {
+      id: 9000,
+      windowId: win.id,
+      index: 1,
+      url: "https://theirs.test/",
+      pinned: false,
+      active: false,
+      groupId: -1,
+      discarded: false,
+      mutedInfo: { muted: false },
+    });
+    return win;
+  };
+
+  await restoreNewest(fake.api, state);
+
+  const [windowId] = createdWindowIds(fake);
+  assert.deepEqual(
+    tabsOf(fake, windowId).map((tab) => tab.url),
+    ["about:blank", "https://theirs.test/", "https://a.test/", "https://b.test/"],
+  );
 });
 
 test("clicking the toolbar icon restores", async () => {
