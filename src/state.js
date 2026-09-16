@@ -11,10 +11,11 @@ export const TAB_GROUP_ID_NONE = -1;
  * history, which is all the window cloner needs to find its source.
  * `suppressedWindowIds` holds windows the cloner is currently filling, so new
  * tab placement stays out of its way.
- * `abortedWindowIds` holds the subset of those that the user closed while the
- * clone was still running. It is only ever written for a window that is
- * currently an in-flight clone target, and the clone clears its own id when it
- * unwinds, so it cannot grow without bound.
+ * `abortedWindowIds` holds the subset of those the clone has found to be gone,
+ * whether from windows.onRemoved or from a call failing in a way that proves
+ * it. It is only ever written for a window that is currently an in-flight
+ * clone target, and the clone clears its own id when it unwinds, so it cannot
+ * grow without bound.
  */
 export function createState() {
   return {

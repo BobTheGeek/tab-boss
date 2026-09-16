@@ -20,6 +20,17 @@ test("isBlankTab recognises the blank URLs a new window can hold", () => {
 });
 
 /**
+ * Every windows.get except the target window's own liveness probe. The probe
+ * is bookkeeping about the window being filled; these tests are about which
+ * window was chosen as the clone source.
+ */
+function sourceLookups(fake, targetId) {
+  return fake.calls.filter(
+    ([name, windowId]) => name === "windows.get" && windowId !== targetId,
+  );
+}
+
+/**
  * Window 1 is the source with two real tabs. Window 2 is the brand new window
  * holding a single blank tab. Focus history says the user came from window 1.
  */
@@ -132,10 +143,10 @@ test("the source is current when focus fired before creation", async () => {
   recordFocus(state, 2);
   const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
   assert.equal(cloned, true);
-  assert.deepEqual(
-    fake.calls.filter(([name]) => name === "windows.get"),
-    [["windows.get", 1]],
-  );
+  // Window 2's own liveness probe is not a source lookup, so it is filtered
+  // out. What matters is that window 1, and only window 1, was looked up as a
+  // clone source.
+  assert.deepEqual(sourceLookups(fake, 2), [["windows.get", 1]]);
 });
 
 test("the source is never the new window itself", async () => {
@@ -379,10 +390,8 @@ test("the clone source is resolved before the first await", async () => {
     clonedTabs(fake, 2).map((tab) => tab.url),
     ["https://right.test/"],
   );
-  assert.deepEqual(
-    fake.calls.filter(([name]) => name === "windows.get"),
-    [["windows.get", 1]],
-  );
+  // Window 3 must never be looked up as a source, whatever focus did mid-gate.
+  assert.deepEqual(sourceLookups(fake, 2), [["windows.get", 1]]);
 });
 
 test("a refused discard does not stop the clone", async () => {
@@ -680,6 +689,9 @@ test("an aborted clone logs nothing at all", async () => {
   // The source holds an unclonable tab, so a clone that ran to completion
   // would print the routine "skipped 1 tab" line. A user closing a window is
   // not news of any kind, so an aborted clone must not print even that.
+  //
+  // The removal lands on the LAST create, so the create loop exits normally
+  // and control reaches the skipped-tab log rather than returning before it.
   const fake = createFakeChrome({
     windows: [{ id: 1 }, { id: 2 }],
     tabs: [
@@ -698,7 +710,7 @@ test("an aborted clone logs nothing at all", async () => {
   fake.api.tabs.create = async (args) => {
     const tab = await create(args);
     createCount += 1;
-    if (createCount === 1) await closeWindow(fake, 2);
+    if (createCount === 2) await closeWindow(fake, 2);
     return tab;
   };
 
@@ -743,4 +755,241 @@ test("closing a window no clone is filling records nothing", async () => {
   // Recording every closed window id would grow without bound for the life of
   // the service worker.
   assert.equal(state.abortedWindowIds.size, 0);
+});
+
+// --- The close lands during the gate, before the clone starts ---------------
+//
+// The gate awaits twice before the first tab is created, and a reflexive close
+// lands right there. windows.onRemoved only records an id that is already an
+// in-flight target, so the watch has to be armed before the first await or the
+// event is dropped and every later guard reads false.
+
+/** Destroys a window without the removal event ever reaching us. */
+function destroyWindowSilently(fake, windowId) {
+  fake.windows.delete(windowId);
+}
+
+test("a window removed during the gate is still caught", async () => {
+  const { fake, state } = setupThreeTabSource();
+  let cut = null;
+  const get = fake.api.windows.get;
+  fake.api.windows.get = async (windowId) => {
+    const win = await get(windowId);
+    // The source lookup is the gate's second await, the last chance to close
+    // the window before the clone starts creating tabs.
+    if (windowId === 1 && cut === null) {
+      await closeWindow(fake, 2);
+      cut = fake.calls.length;
+    }
+    return win;
+  };
+
+  const cloned = await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "tabs.create"),
+    [],
+    "the watch must be armed before the gate's awaits, or it drops this close",
+  );
+  // Only the liveness probe, and then nothing.
+  assert.deepEqual(callsAfter(fake, cut), [["windows.get", 2]]);
+  assert.equal(cloned, false);
+  assert.equal(state.abortedWindowIds.size, 0);
+});
+
+test("a close the watch never saw is caught by the probe", async () => {
+  const { fake, state } = setupThreeTabSource();
+  let cut = null;
+  const get = fake.api.windows.get;
+  fake.api.windows.get = async (windowId) => {
+    const win = await get(windowId);
+    if (windowId === 1 && cut === null) {
+      // No onRemoved: the event is late, or never arrives at all.
+      destroyWindowSilently(fake, 2);
+      cut = fake.calls.length;
+    }
+    return win;
+  };
+
+  const cloned = await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "tabs.create"),
+    [],
+    "one read-only probe before the first mutating call is the belt to the braces",
+  );
+  assert.deepEqual(callsAfter(fake, cut), [["windows.get", 2]]);
+  assert.equal(cloned, false);
+});
+
+// --- A rejection can prove the window is gone before the event says so ------
+
+/** Window 1 holds two separate tab groups plus a loose active tab. */
+function setupTwoGroups() {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    groups: [
+      { id: 77, windowId: 1, title: "One", color: "blue" },
+      { id: 78, windowId: 1, title: "Two", color: "red" },
+    ],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://a.test/", groupId: 77 },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", groupId: 78 },
+      { id: 12, windowId: 1, index: 2, url: "https://c.test/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+  installWindowCloning(fake.api, state);
+  return { fake, state };
+}
+
+test("a group failure that proves the window is gone aborts the whole clone", async () => {
+  const { fake, state } = setupTwoGroups();
+  let cut = null;
+  const group = fake.api.tabs.group;
+  fake.api.tabs.group = async (args) => {
+    const id = await group(args);
+    if (cut === null) {
+      // The rejection beats windows.onRemoved to us. The per-group catch must
+      // not simply fall through to the next group: that dispatches another
+      // tabs.group into a tab strip we have already watched die.
+      destroyWindowSilently(fake, 2);
+      cut = fake.calls.length;
+      throw new Error("window closed");
+    }
+    return id;
+  };
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(
+    fake.calls.filter(([name]) => name === "tabs.group").length,
+    1,
+    "the second group must not be created in a window already known to be gone",
+  );
+  // The probe that proved it, and nothing else: the mark stops every later
+  // phase too.
+  assert.deepEqual(callsAfter(fake, cut), [["windows.get", 2]]);
+  assert.deepEqual(warnings, [], "a closed window is a race, not a failure");
+});
+
+test("a group failure after the removal event does not probe again", async () => {
+  const { fake, state } = setupTwoGroups();
+  let cut = null;
+  const group = fake.api.tabs.group;
+  fake.api.tabs.group = async (args) => {
+    const id = await group(args);
+    if (cut === null) {
+      // This time the event wins the race, so the window's death is already
+      // known and there is nothing left to ask the browser.
+      await closeWindow(fake, 2);
+      cut = fake.calls.length;
+      throw new Error("window closed");
+    }
+    return id;
+  };
+
+  await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+
+  assert.deepEqual(callsAfter(fake, cut), []);
+});
+
+test("a group that cannot be recreated warns once per clone, not once per group", async () => {
+  const { fake, state } = setupTwoGroups();
+  // Both source groups vanish, so both lookups fail while the target lives on.
+  fake.groups.delete(77);
+  fake.groups.delete(78);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  try {
+    await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0][0], /^\[Tab Boss\] could not recreate/);
+  // A warning is not an abort: the rest of the clone still runs.
+  assert.equal(clonedTabs(fake, 2).length, 3);
+  assert.equal(fake.tabs.has(20), false);
+});
+
+// --- Guards that nothing else pins ------------------------------------------
+
+test("a window removed during the group lookup is never grouped into", async () => {
+  const { fake, state } = setupGrouped();
+  installWindowCloning(fake.api, state);
+  let cut = null;
+  const get = fake.api.tabGroups.get;
+  fake.api.tabGroups.get = async (groupId) => {
+    const sourceGroup = await get(groupId);
+    if (cut === null) {
+      await closeWindow(fake, 2);
+      cut = fake.calls.length;
+    }
+    return sourceGroup;
+  };
+
+  await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+
+  assert.deepEqual(
+    fake.calls.filter(([name]) => name === "tabs.group"),
+    [],
+    "tabs.group into a destroyed tab strip is the prime CHECK suspect",
+  );
+  assert.deepEqual(callsAfter(fake, cut), []);
+});
+
+test("a window removed before the mute loop is never muted", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }, { id: 2 }],
+    tabs: [
+      {
+        id: 10,
+        windowId: 1,
+        index: 0,
+        url: "https://a.test/",
+        mutedInfo: { muted: true },
+      },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+      { id: 20, windowId: 2, index: 0, url: "about:blank", active: true },
+    ],
+  });
+  const state = createState();
+  recordFocus(state, 1);
+  installWindowCloning(fake.api, state);
+
+  let cut = null;
+  const create = fake.api.tabs.create;
+  let createCount = 0;
+  fake.api.tabs.create = async (args) => {
+    const tab = await create(args);
+    createCount += 1;
+    // The last create, so the loop exits normally and control reaches the
+    // mute loop rather than returning from the create loop's own guard.
+    if (createCount === 2) {
+      await closeWindow(fake, 2);
+      cut = fake.calls.length;
+    }
+    return tab;
+  };
+
+  await cloneIntoWindow(fake.api, state, { id: 2, type: "normal", incognito: false });
+
+  assert.deepEqual(
+    fake.calls.filter(([name, , props]) => name === "tabs.update" && props?.muted),
+    [],
+  );
+  assert.deepEqual(callsAfter(fake, cut), []);
 });
