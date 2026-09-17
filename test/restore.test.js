@@ -1,11 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFakeChrome } from "./fakeChrome.js";
-import { createState } from "../src/state.js";
+import { createState, installAbortTracking } from "../src/state.js";
 import { appendSnapshot } from "../src/snapshotStore.js";
 import { SNAPSHOT_VERSION } from "../src/snapshot.js";
-import { installFocusTracking, seedFocus } from "../src/focusTracking.js";
-import { installWindowCloning } from "../src/windowCloning.js";
 import { installRestore, restoreNewest } from "../src/restore.js";
 
 function snapshot(windows) {
@@ -82,7 +80,7 @@ async function closeWindow(fake, windowId) {
  * had logged at that moment, so a test can assert on everything that followed.
  */
 function closeFirstWindowMidWrite(fake, state) {
-  installWindowCloning(fake.api, state);
+  installAbortTracking(fake.api, state);
   const create = fake.api.tabs.create;
   let callsAtClose = null;
   fake.api.tabs.create = async (props) => {
@@ -464,7 +462,7 @@ test("a rejection that beats windows.onRemoved is still a silent race", async ()
       { focused: true, groups: [], tabs: [tabSpec("https://c.test/", { active: true })] },
     ]),
   );
-  installWindowCloning(fake.api, state);
+  installAbortTracking(fake.api, state);
 
   const create = fake.api.tabs.create;
   let gone = null;
@@ -598,13 +596,9 @@ test("a created window that is not a lone placeholder is left intact", async () 
   );
 });
 
-test("a restored window is not cloned by the window cloner", async () => {
-  // The whole feature wired together: the user has a focused window of their
-  // own, the cloner and focus tracking are live, and the fake announces a new
-  // window the way Chromium does — windows.onCreated BEFORE windows.create
-  // resolves, so suppressedWindowIds cannot possibly cover it yet. Only
-  // state.restoreInProgress stands between the restored window and a copy of
-  // the user's tabs landing on top of it.
+test("restore creates a new window and leaves an existing window untouched", async () => {
+  // The user has a window of their own; restore must build its window from the
+  // snapshot without disturbing theirs.
   const fake = createFakeChrome({
     windows: [{ id: 1, focused: true }],
     tabs: [
@@ -613,10 +607,7 @@ test("a restored window is not cloned by the window cloner", async () => {
     ],
   });
   const state = createState();
-  installFocusTracking(fake.api, state);
-  installWindowCloning(fake.api, state);
-  await seedFocus(fake.api, state);
-  assert.equal(state.currentWindowId, 1, "the cloner must have a source to copy from");
+  installAbortTracking(fake.api, state);
 
   await appendSnapshot(fake.api, TWO_TABS);
   installRestore(fake.api, state);
@@ -628,7 +619,7 @@ test("a restored window is not cloned by the window cloner", async () => {
   assert.deepEqual(
     tabsOf(fake, restored[0]).map((tab) => tab.url),
     ["https://a.test/", "https://b.test/"],
-    "the cloner dumped the user's focused window on top of the restored tabs",
+    "the restored window holds the snapshot's tabs",
   );
   assert.deepEqual(
     tabsOf(fake, 1).map((tab) => tab.url),
