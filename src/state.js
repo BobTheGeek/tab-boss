@@ -1,69 +1,31 @@
-/** The id Chromium reports when focus leaves the browser entirely. */
-export const WINDOW_ID_NONE = -1;
-
 /** The groupId Chromium reports for a tab that belongs to no group. */
 export const TAB_GROUP_ID_NONE = -1;
 
 /**
- * Cross-module state shared by every Tab Boss feature.
+ * Cross-module state shared by every feature that writes tabs into a window it
+ * created — duplicate-window, tabset-open, and restore.
  *
- * `previousWindowId` / `currentWindowId` together form a two-deep focus
- * history, which is all the window cloner needs to find its source.
- * `suppressedWindowIds` holds windows the cloner is currently filling, so new
- * tab placement stays out of its way.
- * `abortedWindowIds` holds the subset of those the clone has found to be gone,
- * whether from windows.onRemoved or from a call failing in a way that proves
- * it. It is only ever written for a window that is currently an in-flight
- * clone target, and the clone clears its own id when it unwinds, so it cannot
- * grow without bound.
- * `restoreInProgress` is true while restore is creating windows. Restore calls
- * windows.create, which fires windows.onCreated, which is what the cloner
- * listens for — without this the cloner would clone every restored window.
- * suppressedWindowIds cannot do the job: the id is not known until create
- * resolves, and onCreated can fire first. It is deliberately a single flag and
- * not a count: a second toolbar click during a restore does nothing, so the
- * flag has exactly one owner and cannot be lowered out from under it.
- * It also suppresses a genuine Cmd+N for the length of the restore. That is
- * the right trade — a restore is brief, and one window that did not clone is a
- * far smaller loss than a restored window with a clone dumped on top of it.
- * `restoredWindowIds` holds every window restore has created. It exists because
- * `restoreInProgress` is a point-in-time flag and cloning is now decided ~400ms
- * after windows.onCreated: a brief restore (one window, all its tabs
- * unclonable, so it ends blank) can finish and clear the flag before that
- * decision runs, and the blank restored window would then be cloned into — the
- * tb-l56 outcome. This set is tagged synchronously as each window is created
- * and is NOT cleared when the restore ends, so a deferred clone decision still
- * sees it. A restored window is never a Cmd+N and never a clone target for its
- * whole life; membership is cleared only when the window itself closes.
+ * `suppressedWindowIds` holds windows a writer is currently filling, so new tab
+ * placement stays out of its way.
+ * `abortedWindowIds` holds the subset a writer has found to be gone, whether
+ * from windows.onRemoved or from a call failing in a way that proves it. It is
+ * only ever written for a window that is currently an in-flight write target,
+ * and the writer clears its own id when it unwinds, so it cannot grow without
+ * bound.
+ * `restoreInProgress` is true while restore is creating windows; a snapshot
+ * capture refuses while it is set, so a half-built restore is never stored.
+ * `restoredWindowIds` holds every window Tab Boss itself created (restore,
+ * duplicate, tabset-open). A window Tab Boss made is never a clone target, and
+ * this outlives `restoreInProgress` — it is tagged synchronously as each window
+ * is created and cleared only when the window itself closes (tb-l56).
  */
 export function createState() {
   return {
-    previousWindowId: null,
-    currentWindowId: null,
     suppressedWindowIds: new Set(),
     abortedWindowIds: new Set(),
     restoreInProgress: false,
     restoredWindowIds: new Set(),
   };
-}
-
-export function recordFocus(state, windowId) {
-  if (windowId == null || windowId === WINDOW_ID_NONE) return;
-  if (windowId === state.currentWindowId) return;
-  state.previousWindowId = state.currentWindowId;
-  state.currentWindowId = windowId;
-}
-
-/**
- * Chromium does not promise whether windows.onCreated or
- * windows.onFocusChanged fires first for a new window, so the source is
- * derived rather than read from one field. Either ordering lands on the window
- * the user actually came from.
- */
-export function resolveSourceWindowId(state, newWindowId) {
-  return state.currentWindowId !== newWindowId
-    ? state.currentWindowId
-    : state.previousWindowId;
 }
 
 /**
@@ -72,10 +34,8 @@ export function resolveSourceWindowId(state, newWindowId) {
  * This lives beside `createAbortWatch` because the two are halves of the same
  * mechanism: without this listener every `watch.aborted()` in the project
  * reads false forever and the tb-084 crash protection is silently gone. It is
- * installed by every feature that builds an abort watch — the cloner and
- * restore both — rather than by one of them on the other's behalf. Deleting
- * `installWindowCloning` from background.js used to disarm restore's
- * protection with the whole suite still green.
+ * installed once from background.js, and covers every writer that builds an
+ * abort watch — duplicate-window, tabset-open, and restore.
  *
  * Installing it twice is harmless: the guard is a pure read and `Set.add` is
  * idempotent, so a second delivery of the same id changes nothing.
