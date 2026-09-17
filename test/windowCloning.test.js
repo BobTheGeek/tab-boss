@@ -1037,3 +1037,30 @@ test("writeIntoNewWindow returns false when a window cannot be created", async (
   const created = await writeIntoNewWindow(fake.api, state, () => ({ plan: [], groups: [] }));
   assert.equal(created, false);
 });
+
+test("writeIntoNewWindow does not remove the placeholder when the window aborted mid-write", async () => {
+  // Pins the abort check before the placeholder removal: if the target closes
+  // during the write, tabs.remove must not be called into a dead window — the
+  // tb-084 pattern.
+  const fake = createFakeChrome({ windows: [{ id: 1 }], tabs: [] });
+  const state = createState();
+  const origCreate = fake.api.tabs.create;
+  fake.api.tabs.create = async (args) => {
+    const tab = await origCreate(args);
+    // The target dies the instant its first tab lands.
+    state.abortedWindowIds.add(args.windowId);
+    return tab;
+  };
+
+  const plan = [
+    { url: "https://a.test/", pinned: false, muted: false, active: false, groupKey: null },
+    { url: "https://b.test/", pinned: false, muted: false, active: true, groupKey: null },
+  ];
+  await writeIntoNewWindow(fake.api, state, () => ({ plan, groups: [] }));
+
+  assert.equal(
+    fake.calls.some(([name]) => name === "tabs.remove"),
+    false,
+    "no tab may be removed once the window is known gone",
+  );
+});
