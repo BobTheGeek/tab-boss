@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <form id="save-form">
+      <input
+        id="name"
+        type="text"
+        placeholder="Name this window's tabs"
+        autocomplete="off"
+      />
+      <button id="save" type="submit">Save</button>
+    </form>
+    <p id="status" class="status" hidden></p>
+    <ul id="list" class="list"></ul>
+    <footer>
+      <label class="toggle">
+        <input id="snapshots" type="checkbox" />
+        Automatic snapshots &amp; restore
+      </label>
+      <button id="restore" type="button" hidden>Restore last backup</button>
+    </footer>
+    <script type="module" src="src/popup.js"></script>
+  </body>
+</html>

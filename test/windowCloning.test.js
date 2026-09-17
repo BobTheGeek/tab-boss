@@ -9,6 +9,7 @@ import {
   installWindowCloning,
   isBlankTab,
   isClonableUrl,
+  writeIntoNewWindow,
 } from "../src/windowCloning.js";
 
 test("isBlankTab recognises the blank URLs a new window can hold", () => {
@@ -999,5 +1000,81 @@ test("an all-unclonable source leaves the new window with its blank tab", async 
     [...fake.tabs.values()].filter((t) => t.windowId === newId).length,
     1,
     "the new window must not vanish",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// writeIntoNewWindow — the shared tagged new-window write (duplicate + tabset)
+// ---------------------------------------------------------------------------
+
+test("writeIntoNewWindow writes a stored plan into a fresh tagged window", async () => {
+  const fake = createFakeChrome({ windows: [{ id: 1 }], tabs: [] });
+  const state = createState();
+  const before = new Set(fake.windows.keys());
+
+  const plan = [
+    { url: "https://a.test/", pinned: false, muted: false, active: false, groupKey: null },
+    { url: "https://b.test/", pinned: false, muted: false, active: true, groupKey: null },
+  ];
+  const created = await writeIntoNewWindow(fake.api, state, () => ({ plan, groups: [] }));
+  assert.equal(created, true);
+
+  const [newId] = [...fake.windows.keys()].filter((id) => !before.has(id));
+  const urls = [...fake.tabs.values()]
+    .filter((t) => t.windowId === newId)
+    .sort((a, b) => a.index - b.index)
+    .map((t) => t.url);
+  assert.deepEqual(urls, ["https://a.test/", "https://b.test/"]);
+  assert.ok(state.restoredWindowIds.has(newId), "the new window must be tagged");
+});
+
+test("writeIntoNewWindow returns false when a window cannot be created", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  fake.api.windows.create = async () => {
+    throw new Error("no window");
+  };
+  const created = await writeIntoNewWindow(fake.api, state, () => ({ plan: [], groups: [] }));
+  assert.equal(created, false);
+});
+
+test("writeIntoNewWindow does not remove the placeholder when the window aborted mid-write", async () => {
+  // Pins the abort check before the placeholder removal: if the target closes
+  // during the write, tabs.remove must not be called into a dead window — the
+  // tb-084 pattern.
+  const fake = createFakeChrome({ windows: [{ id: 1 }], tabs: [] });
+  const state = createState();
+  const origCreate = fake.api.tabs.create;
+  fake.api.tabs.create = async (args) => {
+    const tab = await origCreate(args);
+    // The target dies the instant its first tab lands.
+    state.abortedWindowIds.add(args.windowId);
+    return tab;
+  };
+
+  const plan = [
+    { url: "https://a.test/", pinned: false, muted: false, active: false, groupKey: null },
+    { url: "https://b.test/", pinned: false, muted: false, active: true, groupKey: null },
+  ];
+  await writeIntoNewWindow(fake.api, state, () => ({ plan, groups: [] }));
+
+  assert.equal(
+    fake.calls.some(([name]) => name === "tabs.remove"),
+    false,
+    "no tab may be removed once the window is known gone",
+  );
+});
+
+test("writeIntoNewWindow writes nothing when buildPlan returns null", async () => {
+  // buildPlan returning null means the read was abandoned (e.g. the target
+  // aborted). The window is created but no tab is written and it returns true.
+  const fake = createFakeChrome({ windows: [{ id: 1 }], tabs: [] });
+  const state = createState();
+  const created = await writeIntoNewWindow(fake.api, state, () => null);
+  assert.equal(created, true);
+  assert.equal(
+    fake.calls.some(([name]) => name === "tabs.create"),
+    false,
+    "no tab may be created when there is no plan",
   );
 });

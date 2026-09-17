@@ -7,6 +7,7 @@ import {
   updateMeta,
   writeConsecutiveLosses,
 } from "./snapshotStore.js";
+import { readSettings } from "./settingsStore.js";
 
 export const SNAPSHOT_ALARM = "tab-boss-snapshot";
 export const SNAPSHOT_PERIOD_MINUTES = 2;
@@ -46,7 +47,7 @@ async function readCapturableWindows(api) {
  * testable without waiting a minute. `state` is the shared state object; a
  * restore in flight is a fourth reason to refuse.
  *
- * Returns "saved" | "quiet" | "loss" | "unchanged" | "restoring".
+ * Returns "saved" | "quiet" | "loss" | "unchanged" | "restoring" | "disabled".
  */
 export async function captureNow(api, now, state) {
   // A restore is halfway through building windows, so the browser right now is
@@ -55,6 +56,10 @@ export async function captureNow(api, now, state) {
   // tick self-heals, but a several-hundred-tab restore runs longer than the
   // two-minute period, which turns a possibility into a certainty.
   if (state.restoreInProgress) return "restoring";
+
+  // The user can turn the whole automatic snapshot system off from the popup.
+  // The alarm still fires; it just does nothing while disabled.
+  if (!(await readSettings(api)).snapshotsEnabled) return "disabled";
 
   const meta = await readMeta(api);
 

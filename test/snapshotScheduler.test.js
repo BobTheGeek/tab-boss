@@ -11,6 +11,7 @@ import {
   writeMeta,
 } from "../src/snapshotStore.js";
 import { totalTabs } from "../src/snapshot.js";
+import { writeSettings } from "../src/settingsStore.js";
 import {
   MAX_CONSECUTIVE_LOSSES,
   QUIET_PERIOD_MS,
@@ -347,4 +348,11 @@ test("the alarm takes no snapshot during a restore", async () => {
     [],
     "the scheduler must be given the shared state, not just the api",
   );
+});
+
+test("captureNow does nothing when snapshots are disabled", async () => {
+  const { api } = fakeWith(3);
+  await writeSettings(api, { snapshotsEnabled: false });
+  assert.equal(await captureNow(api, 0, createState()), "disabled");
+  assert.deepEqual(await readSnapshots(api), []);
 });

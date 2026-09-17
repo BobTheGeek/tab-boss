@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Boss",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "New tabs to the bottom. Duplicate the current window on demand. Automatic tab-layout snapshots. Auto-clone-on-new-window is disabled: on ego lite a new Space is indistinguishable from Cmd+N.",
   "icons": {
     "16": "icons/icon16.png",
@@ -17,7 +17,8 @@
     "contextMenus"
   ],
   "action": {
-    "default_title": "Tab Boss — restore the newest tab layout",
+    "default_title": "Tab Boss — saved tabsets and snapshots",
+    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png"

@@ -148,6 +148,16 @@ export async function restoreNewest(api, state) {
   return created;
 }
 
+/**
+ * NOT wired in production. The toolbar action now opens a popup
+ * (manifest `default_popup`), which suppresses `action.onClicked`, so restore
+ * is triggered by the popup's "Restore last backup" button — a message that
+ * reaches `restoreNewest` through `handlePopupMessage`. This installer is
+ * retained only so its `test/restore.test.js` cases can drive `restoreNewest`
+ * and its abort tracking through the onClicked path. If restore ever needs a
+ * production trigger again, wire this from `background.js`; until then, do not
+ * mistake its green tests for a live code path.
+ */
 export function installRestore(api, state) {
   // Manifest V3 requires listeners to register synchronously at the top level.
   api.action.onClicked.addListener(async () => {

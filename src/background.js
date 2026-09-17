@@ -5,11 +5,11 @@ import {
 } from "./state.js";
 import { installFocusTracking, seedFocus } from "./focusTracking.js";
 import { installNewTabPlacement } from "./newTabPlacement.js";
-import { installRestore } from "./restore.js";
 import { installSnapshotScheduler } from "./snapshotScheduler.js";
 import { cloneIntoWindow, installWindowCloning } from "./windowCloning.js";
 import { installDuplicateWindow } from "./duplicateWindow.js";
 import { installWindowObserver } from "./windowObserver.js";
+import { handlePopupMessage } from "./popupService.js";
 
 /**
  * MASTER SWITCH for AUTO-clone-on-new-window, and it stays off.
@@ -49,13 +49,20 @@ installAbortTracking(chrome, state);
 installDuplicateWindow(chrome, state);
 
 if (TAB_WRITING_ENABLED) {
-  // installWindowCloning now installs ONLY the abort tracking (the
-  // windows.onRemoved listener that arms the per-window abort watch). Both the
-  // observer-driven clone and restore depend on it. Cloning itself is driven
-  // by the observer below.
+  // installWindowCloning installs only the abort tracking (already installed
+  // above). Left here so re-enabling the switch keeps its old shape; the
+  // observer below drives the clone.
   installWindowCloning(chrome, state);
-  installRestore(chrome, state);
 }
+
+// The popup sends capture / open / restore messages. Restore is reached this
+// way now, not through action.onClicked — a default_popup suppresses that
+// event. Returning true keeps the channel open for the async reply, as
+// Manifest V3 requires.
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  handlePopupMessage(chrome, state, message, () => Date.now()).then(sendResponse);
+  return true;
+});
 
 // The window observer is the single windows.onCreated brain. It classifies
 // every new window and writes the verdict to its own storage key — always, so
