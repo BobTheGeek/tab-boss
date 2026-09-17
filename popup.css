@@ -1,0 +1,62 @@
+body {
+  width: 320px;
+  margin: 0;
+  padding: 12px;
+  font: 13px/1.4 system-ui, sans-serif;
+  color: #1a1a1a;
+}
+#save-form {
+  display: flex;
+  gap: 6px;
+}
+#name {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+button {
+  padding: 6px 10px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #f6f6f6;
+  cursor: pointer;
+}
+button:hover {
+  background: #ececec;
+}
+.status {
+  margin: 8px 0 0;
+  color: #666;
+}
+.list {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+}
+.list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  border-top: 1px solid #eee;
+}
+.list .name {
+  flex: 1;
+}
+.list .count {
+  color: #999;
+}
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid #eee;
+  padding-top: 10px;
+}
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}

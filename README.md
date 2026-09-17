@@ -106,3 +106,17 @@ Limiting pinned tabs to 3 per row is impossible from an extension. The tab
 strip is native browser code, and Chromium blocks extensions from injecting
 script or CSS into `chrome://` pages. See
 `docs/superpowers/specs/2026-09-15-tab-boss-design.md` for the full evidence.
+
+## Saved tabsets — manual smoke test
+
+1. Open a window with a few tabs, a pinned tab, and a group. Click the Tab Boss
+   toolbar icon; the popup opens.
+2. Type "Test Set" and Save. It appears in the list with its tab count.
+3. Click Open. A new window appears with the same tabs, order, pinned tab, and
+   group. Your original window is untouched.
+4. Change the window, save "Test Set" again — the button says "Replace?"; click
+   again. The list's tab count updates.
+5. Click ✕ on the row — it says "Sure?"; click again. The set is gone.
+6. Turn the "Automatic snapshots & restore" toggle off. In the service worker
+   console, confirm no new snapshot is written for a few minutes. Turn it back
+   on and confirm one is, and that "Restore last backup" appears and works.
