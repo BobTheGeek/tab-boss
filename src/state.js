@@ -26,6 +26,15 @@ export const TAB_GROUP_ID_NONE = -1;
  * It also suppresses a genuine Cmd+N for the length of the restore. That is
  * the right trade — a restore is brief, and one window that did not clone is a
  * far smaller loss than a restored window with a clone dumped on top of it.
+ * `restoredWindowIds` holds every window restore has created. It exists because
+ * `restoreInProgress` is a point-in-time flag and cloning is now decided ~400ms
+ * after windows.onCreated: a brief restore (one window, all its tabs
+ * unclonable, so it ends blank) can finish and clear the flag before that
+ * decision runs, and the blank restored window would then be cloned into — the
+ * tb-l56 outcome. This set is tagged synchronously as each window is created
+ * and is NOT cleared when the restore ends, so a deferred clone decision still
+ * sees it. A restored window is never a Cmd+N and never a clone target for its
+ * whole life; membership is cleared only when the window itself closes.
  */
 export function createState() {
   return {
@@ -34,6 +43,7 @@ export function createState() {
     suppressedWindowIds: new Set(),
     abortedWindowIds: new Set(),
     restoreInProgress: false,
+    restoredWindowIds: new Set(),
   };
 }
 
@@ -72,6 +82,11 @@ export function resolveSourceWindowId(state, newWindowId) {
  */
 export function installAbortTracking(api, state) {
   api.windows.onRemoved.addListener((windowId) => {
+    // A window restore created is never a clone target; once it is gone we can
+    // forget it. Cleared here to bound `restoredWindowIds` over a long session
+    // with many restores. Chromium does not reuse window ids within a session,
+    // so this can never drop a tag a live window still needs.
+    state.restoredWindowIds.delete(windowId);
     // Only in-flight write targets are recorded. Remembering every window the
     // user ever closed would leak for the life of the service worker, and each
     // writer clears its own id as it unwinds.

@@ -909,3 +909,66 @@ test("a window created during a restore is never cloned, even with a clone wired
   const [record] = await readObservations(fake.api);
   assert.equal(record.action, "clone-declined-by-writer");
 });
+
+test("a window restore created is not cloned via the observer once the flag clears", async (t) => {
+  // The tb-l56 restore-race, end to end through the observer: restore has
+  // finished (restoreInProgress is false) but the restored window's clone
+  // verdict was still pending. The tag restore left must veto it.
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://a.test/" },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+    ],
+  });
+  fake.storage.set("meta", { browserStartedAt: LONG_AGO });
+  fake.session.set(SESSION_START_KEY, LONG_AGO);
+
+  const state = createState();
+  recordFocus(state, 1);
+  installWindowCloning(fake.api, state);
+  state.restoreInProgress = false; // the restore already ended
+  state.restoredWindowIds.add(2); // but it created window 2, still blank
+
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args);
+  t.after(() => {
+    console.log = originalLog;
+  });
+
+  const clock = createManualClock(START);
+  const observer = installWindowObserver(fake.api, {
+    now: clock.now,
+    wait: clock.wait,
+    resolveCloneSource: (win) => resolveSourceWindowId(state, win.id),
+    performClone: (win, sourceId) =>
+      cloneIntoWindow(fake.api, state, win, sourceId),
+  });
+
+  // The restored window looks exactly like a Cmd+N: blank, focused fast, past
+  // the quiet period, alone.
+  const win = { id: 2, type: "normal", incognito: false, focused: true };
+  fake.windows.set(2, win);
+  fake.tabs.set(20, {
+    id: 20,
+    windowId: 2,
+    index: 0,
+    url: "about:blank",
+    pinned: false,
+    active: true,
+    groupId: -1,
+    mutedInfo: { muted: false },
+  });
+
+  void fake.api.windows.onCreated.emit(win);
+  clock.advance(30);
+  void fake.api.windows.onFocusChanged.emit(2);
+  clock.advance(FOCUS_GRACE_MS + 1);
+  await observer.idle();
+
+  const win2Tabs = [...fake.tabs.values()].filter((tab) => tab.windowId === 2);
+  assert.equal(win2Tabs.length, 1, "the restored window must be left untouched");
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.action, "clone-declined-by-writer");
+});

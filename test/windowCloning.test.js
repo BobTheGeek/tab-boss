@@ -75,6 +75,19 @@ test("the cloner ignores a window while a restore is running", async () => {
   assert.deepEqual(fake.calls, [], "it must not even look at the window");
 });
 
+test("a window restore created is never cloned, even after the restore ended", async () => {
+  // The tb-l56 restore-race: cloning is decided ~400ms after onCreated, so a
+  // brief restore can finish and clear restoreInProgress before the decision
+  // runs. The tag restore left on the window must still veto the clone, even
+  // though the window now looks exactly like a deliberate Cmd+N.
+  const { fake, state } = setupClonable();
+  state.restoreInProgress = false; // the restore has already finished
+  state.restoredWindowIds.add(2); // but it created window 2
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(cloned, false);
+  assert.deepEqual(fake.calls, [], "a restored window is never a clone target");
+});
+
 test("a window holding a real page is not cloned into", async () => {
   const fake = createFakeChrome({
     windows: [{ id: 1 }, { id: 2 }],
@@ -496,6 +509,15 @@ test("closing a window no clone is filling records nothing", async () => {
   // Recording every closed window id would grow without bound for the life of
   // the service worker.
   assert.equal(state.abortedWindowIds.size, 0);
+});
+
+test("closing a restored window forgets its clone-target veto", async () => {
+  // restoredWindowIds must be cleared when the window closes, or it grows for
+  // the life of the worker across a long session of restores.
+  const { fake, state } = setupThreeTabSource(); // installs abort tracking
+  state.restoredWindowIds.add(2);
+  await fake.api.windows.onRemoved.emit(2);
+  assert.equal(state.restoredWindowIds.has(2), false);
 });
 
 // --- The close lands during the gate, before the clone starts ---------------

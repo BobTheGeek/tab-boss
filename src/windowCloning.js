@@ -116,6 +116,14 @@ export async function cloneIntoWindow(
   // smaller loss than a restored window with a clone dumped on top of it.
   if (state.restoreInProgress) return false;
 
+  // A window restore created is never a Cmd+N and must never be a clone target.
+  // Unlike restoreInProgress, this holds however late the decision runs: the
+  // observer now decides ~400ms after windows.onCreated, by which time a brief
+  // restore may have finished and cleared its flag, but the tag restore set
+  // when it created the window is still here. This is the fix for the tb-l56
+  // restore-race, where a blank restored window got the user's tabs cloned on.
+  if (state.restoredWindowIds.has(newWindow.id)) return false;
+
   // `sourceId` must be fixed from the focus history at the moment the window
   // was created. When the cloner was called synchronously on
   // windows.onCreated that was automatic, and the default above still does it

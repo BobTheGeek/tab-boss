@@ -645,3 +645,51 @@ test("clicking the toolbar icon restores", async () => {
   await fake.api.action.onClicked.emit({});
   assert.equal(createdWindowIds(fake).length, 1);
 });
+
+test("restore tags every window it creates so a deferred clone cannot target it", async () => {
+  // The tb-l56 restore-race fix: restoreInProgress is cleared when the restore
+  // ends, but the clone decision runs ~400ms later. restore must leave a tag
+  // that outlives the flag, so the cloner still refuses the restored window.
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      { focused: false, groups: [], tabs: [tabSpec("https://a.test/", { active: true })] },
+      { focused: true, groups: [], tabs: [tabSpec("https://b.test/", { active: true })] },
+    ]),
+  );
+
+  await restoreNewest(fake.api, state);
+
+  const created = createdWindowIds(fake);
+  assert.equal(created.length, 2);
+  for (const id of created) {
+    assert.ok(
+      state.restoredWindowIds.has(id),
+      `restored window ${id} must be tagged`,
+    );
+  }
+  // And the flag is back down: the tag is the only thing protecting these now.
+  assert.equal(state.restoreInProgress, false);
+});
+
+test("an all-unclonable snapshot window is still tagged, since that is the window at risk", async () => {
+  // This is the exact reproduction shape: a snapshot window whose only tab is
+  // unclonable comes back blank, and a blank window is precisely what a clone
+  // would overwrite. It must be tagged even though nothing was written into it.
+  const fake = createFakeChrome();
+  const state = createState();
+  await appendSnapshot(
+    fake.api,
+    snapshot([
+      { focused: true, groups: [], tabs: [tabSpec("chrome://settings/", { active: true })] },
+    ]),
+  );
+
+  await restoreNewest(fake.api, state);
+
+  const [id] = createdWindowIds(fake);
+  assert.equal(tabsOf(fake, id).length, 1, "the window came back blank");
+  assert.ok(state.restoredWindowIds.has(id), "the blank restored window must be tagged");
+});

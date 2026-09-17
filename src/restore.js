@@ -36,6 +36,13 @@ async function restoreWindow(api, state, snapshotWindow) {
   }
 
   state.suppressedWindowIds.add(target.id);
+  // Tagged synchronously, the instant the window exists, and deliberately NOT
+  // removed when this restore ends. Cloning is decided ~400ms after
+  // windows.onCreated; a brief restore can clear restoreInProgress before that
+  // decision runs, so the flag alone cannot protect a window whose clone
+  // verdict is still pending. This tag outlives the flag and is cleared only
+  // when the window itself closes (tb-l56 restore-race).
+  state.restoredWindowIds.add(target.id);
   const watch = createAbortWatch(state, target.id);
   try {
     const placeholders = await api.tabs.query({ windowId: target.id });
