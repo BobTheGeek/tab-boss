@@ -1,31 +1,33 @@
-import { createState, resolveSourceWindowId } from "./state.js";
+import {
+  createState,
+  installAbortTracking,
+  resolveSourceWindowId,
+} from "./state.js";
 import { installFocusTracking, seedFocus } from "./focusTracking.js";
 import { installNewTabPlacement } from "./newTabPlacement.js";
 import { installRestore } from "./restore.js";
 import { installSnapshotScheduler } from "./snapshotScheduler.js";
 import { cloneIntoWindow, installWindowCloning } from "./windowCloning.js";
+import { installDuplicateWindow } from "./duplicateWindow.js";
 import { installWindowObserver } from "./windowObserver.js";
 
 /**
- * MASTER SWITCH for everything that writes tabs.
+ * MASTER SWITCH for AUTO-clone-on-new-window, and it stays off.
  *
- * History: Tab Boss cloned the user's tabs into ~10 windows and ~350 tabs
- * (tb-l56). The cause was ego lite Spaces: a Space presents to the extension
- * API as an ordinary window and ego rebuilds every Space at launch, so a
- * restart replays a storm of windows.onCreated events indistinguishable, to
- * the old gate, from pressing Cmd+N. The extension ran observe-only for a day;
- * the log, checked against ground truth on the real browser, showed the
- * discriminator: a genuine Cmd+N grabs focus within ~11ms, a mid-session Space
- * never takes focus, and a restart-storm Space (which DOES focus fast) is
- * caught by the startup quiet period and the burst counter. Focus and the
- * quiet period are both load-bearing and cover different cases.
+ * Auto-clone cloned the user's tabs into ~10 windows and ~350 tabs (tb-l56).
+ * The cause was ego lite Spaces: a Space presents to the extension API as an
+ * ordinary window and ego rebuilds every Space at launch. We ran observe-only
+ * for a day, then live-tested on the real browser — and found the wall:
+ * CREATING a new Space produces a blank window that grabs focus in ~12ms,
+ * identical to Cmd+N in every signal the classifier has. There is no
+ * extension-visible signal that tells a new Space from a new window, so no
+ * windows.onCreated handler can safely decide to clone. Auto-clone is not
+ * fixable on ego lite; this stays false.
  *
- * So cloning is back on, but behind the classifier. The window observer is the
- * single windows.onCreated handler; when it classifies a window as a deliberate
- * Cmd+N it hands it to the cloner, which runs its own gate and every tb-084
- * abort guard on top. Set this to false and the extension returns to
- * observe-only: it classifies and logs, and writes nothing. It remains the one
- * lever that disables all tab writing.
+ * The user-triggered replacement is `installDuplicateWindow` below: the user
+ * asks by name, so there is nothing to detect and no storm to fear. The
+ * observer/classifier code is left in the tree, and installed below for its
+ * logging only, as the record of what was tried.
  */
 const TAB_WRITING_ENABLED = false;
 
@@ -35,6 +37,16 @@ const state = createState();
 // otherwise an evicted service worker will not be woken for the event.
 installFocusTracking(chrome, state);
 installNewTabPlacement(chrome, state);
+
+// Abort tracking — the windows.onRemoved listener that arms the per-window
+// abort watch — is needed by anything that writes tabs into a window it
+// created. Duplicate-window uses it, so it is installed unconditionally,
+// independent of the dead auto-clone switch.
+installAbortTracking(chrome, state);
+
+// Duplicate this window: an explicit keyboard command and right-click item.
+// The safe replacement for auto-clone. Nothing here fires on a window event.
+installDuplicateWindow(chrome, state);
 
 if (TAB_WRITING_ENABLED) {
   // installWindowCloning now installs ONLY the abort tracking (the

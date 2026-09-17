@@ -70,6 +70,7 @@ export function createFakeChrome(initial = {}) {
   const alarms = new Map();
   const calls = [];
   const badge = { text: "" };
+  const menus = new Map();
   let nextTabId = 1000;
   let nextGroupId = 500;
   let nextWindowId = 50;
@@ -301,6 +302,24 @@ export function createFakeChrome(initial = {}) {
       onInstalled: createEvent(),
     },
 
+    commands: {
+      onCommand: createEvent(),
+    },
+
+    contextMenus: {
+      onClicked: createEvent(),
+      create(properties, callback) {
+        calls.push(["contextMenus.create", properties]);
+        menus.set(properties.id, { ...properties });
+        if (callback) callback();
+      },
+      removeAll(callback) {
+        calls.push(["contextMenus.removeAll"]);
+        menus.clear();
+        if (callback) callback();
+      },
+    },
+
     storage: {
       local: createStorageArea("local", storage),
       // A separate backing map, because the real areas have different
@@ -311,5 +330,5 @@ export function createFakeChrome(initial = {}) {
     },
   };
 
-  return { api, calls, tabs, windows, groups, storage, session, alarms, badge };
+  return { api, calls, tabs, windows, groups, storage, session, alarms, badge, menus };
 }
