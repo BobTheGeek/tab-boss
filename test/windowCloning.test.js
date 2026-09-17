@@ -9,6 +9,7 @@ import {
   installWindowCloning,
   isBlankTab,
   isClonableUrl,
+  writeIntoNewWindow,
 } from "../src/windowCloning.js";
 
 test("isBlankTab recognises the blank URLs a new window can hold", () => {
@@ -1000,4 +1001,39 @@ test("an all-unclonable source leaves the new window with its blank tab", async 
     1,
     "the new window must not vanish",
   );
+});
+
+// ---------------------------------------------------------------------------
+// writeIntoNewWindow — the shared tagged new-window write (duplicate + tabset)
+// ---------------------------------------------------------------------------
+
+test("writeIntoNewWindow writes a stored plan into a fresh tagged window", async () => {
+  const fake = createFakeChrome({ windows: [{ id: 1 }], tabs: [] });
+  const state = createState();
+  const before = new Set(fake.windows.keys());
+
+  const plan = [
+    { url: "https://a.test/", pinned: false, muted: false, active: false, groupKey: null },
+    { url: "https://b.test/", pinned: false, muted: false, active: true, groupKey: null },
+  ];
+  const created = await writeIntoNewWindow(fake.api, state, () => ({ plan, groups: [] }));
+  assert.equal(created, true);
+
+  const [newId] = [...fake.windows.keys()].filter((id) => !before.has(id));
+  const urls = [...fake.tabs.values()]
+    .filter((t) => t.windowId === newId)
+    .sort((a, b) => a.index - b.index)
+    .map((t) => t.url);
+  assert.deepEqual(urls, ["https://a.test/", "https://b.test/"]);
+  assert.ok(state.restoredWindowIds.has(newId), "the new window must be tagged");
+});
+
+test("writeIntoNewWindow returns false when a window cannot be created", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  fake.api.windows.create = async () => {
+    throw new Error("no window");
+  };
+  const created = await writeIntoNewWindow(fake.api, state, () => ({ plan: [], groups: [] }));
+  assert.equal(created, false);
 });

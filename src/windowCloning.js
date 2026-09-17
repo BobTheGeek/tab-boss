@@ -43,7 +43,7 @@ function isCloneSource(win) {
  *
  * Returns { plan, groups } or null when the read was abandoned.
  */
-async function planFromWindow(api, sourceId, watch) {
+export async function planFromWindow(api, sourceId, watch) {
   // Reached when the removal event arrived during the gate but the window was
   // still queryable, so the caller's liveness probe said "alive" and only the
   // armed watch knows better.
@@ -225,18 +225,69 @@ export async function cloneIntoWindow(
 }
 
 /**
+ * Creates a new window and writes a plan into it, with every tb-084 abort
+ * guard. The plan is produced by `buildPlan`, which receives the target's abort
+ * watch: duplicate-window builds it from the focused window (so it can bail if
+ * the target dies during the source read); tabset-open just returns a stored
+ * plan. One implementation of the tagged new-window write, two callers.
+ *
+ * Returns true when a window was created — even if the write then aborted or
+ * failed — and false only when the window itself could not be created.
+ */
+export async function writeIntoNewWindow(api, state, buildPlan) {
+  let target;
+  try {
+    target = await api.windows.create({});
+  } catch (error) {
+    console.warn("[Tab Boss] could not create a window", error);
+    return false;
+  }
+
+  // Tagged the instant it exists and NOT cleared when this finishes: nothing may
+  // ever clone onto a window Tab Boss itself created. Cleared only on close
+  // (windows.onRemoved). suppressedWindowIds keeps new tab placement off it.
+  state.suppressedWindowIds.add(target.id);
+  state.restoredWindowIds.add(target.id);
+  const watch = createAbortWatch(state, target.id);
+  try {
+    const placeholders = await api.tabs.query({ windowId: target.id });
+    const described = await buildPlan(watch);
+    if (watch.aborted() || described === null) return true;
+    const written = await writeTabs(
+      api,
+      watch,
+      target.id,
+      described.plan,
+      described.groups,
+    );
+    // The placeholder belongs to a window that has gone; nothing safe to call.
+    if (watch.aborted()) return true;
+    // Removing a window's last tab closes it. If nothing could be written,
+    // leave the blank tab rather than making the window vanish.
+    if (written.length > 0 && placeholders.length === 1) {
+      await api.tabs.remove(placeholders[0].id);
+    }
+    return true;
+  } catch (error) {
+    // The user can close the new window mid-write. Expected race, silent;
+    // anything else must be findable.
+    if (!watch.aborted() && (await windowStillOpen(api, target.id))) {
+      console.warn("[Tab Boss] write into new window failed", error);
+    }
+    return true;
+  } finally {
+    state.suppressedWindowIds.delete(target.id);
+    state.abortedWindowIds.delete(target.id);
+  }
+}
+
+/**
  * Explicitly duplicates the user's current window into a brand new one.
  *
- * This is the user-triggered replacement for auto-clone-on-new-window, which
- * cannot work on ego lite: creating a Space is indistinguishable from Cmd+N, so
- * no windows.onCreated handler can safely decide to clone (tb-l56). Here the
- * user asks for it by name, so there is nothing to detect and no storm to fear.
- *
+ * The user-triggered replacement for auto-clone-on-new-window, which cannot
+ * work on ego lite: creating a Space is indistinguishable from Cmd+N (tb-l56).
  * The source is whatever window has focus when the command fires, captured
- * BEFORE the new window is created (windows.create steals focus). It reuses the
- * same crash-hardened write path as the cloner: an abort watch checked before
- * every call, the new window tagged so nothing else ever writes to it, and the
- * placeholder left in place if nothing could be copied.
+ * BEFORE the new window is created (windows.create steals focus).
  *
  * Returns true when a window was created, false when there was nothing to copy.
  */
@@ -250,52 +301,9 @@ export async function duplicateFocusedWindow(api, state) {
   }
   if (!source || source.type !== "normal" || source.incognito) return false;
 
-  let target;
-  try {
-    target = await api.windows.create({});
-  } catch (error) {
-    console.warn("[Tab Boss] duplicate failed", error);
-    return false;
-  }
-
-  // Tagged the instant it exists and, like restore, NOT cleared when this
-  // finishes: nothing may ever clone onto a window Tab Boss itself created.
-  // Cleared only when the window closes (windows.onRemoved). suppressedWindowIds
-  // keeps new tab placement off it while it fills.
-  state.suppressedWindowIds.add(target.id);
-  state.restoredWindowIds.add(target.id);
-  const watch = createAbortWatch(state, target.id);
-  try {
-    const placeholders = await api.tabs.query({ windowId: target.id });
-    const described = await planFromWindow(api, source.id, watch);
-    if (watch.aborted() || described === null) return true;
-    const written = await writeTabs(
-      api,
-      watch,
-      target.id,
-      described.plan,
-      described.groups,
-    );
-    // The placeholder belongs to a window that has gone; nothing safe to call.
-    if (watch.aborted()) return true;
-    // Removing a window's last tab closes it. If the source held only
-    // unclonable tabs, leave the new window with its blank tab rather than
-    // making it vanish.
-    if (written.length > 0 && placeholders.length === 1) {
-      await api.tabs.remove(placeholders[0].id);
-    }
-    return true;
-  } catch (error) {
-    // The user can close the new window mid-copy. That is an expected race and
-    // stays silent; anything else must be findable.
-    if (!watch.aborted() && (await windowStillOpen(api, target.id))) {
-      console.warn("[Tab Boss] duplicate failed", error);
-    }
-    return true;
-  } finally {
-    state.suppressedWindowIds.delete(target.id);
-    state.abortedWindowIds.delete(target.id);
-  }
+  return writeIntoNewWindow(api, state, (watch) =>
+    planFromWindow(api, source.id, watch),
+  );
 }
 
 /**
