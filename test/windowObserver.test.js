@@ -12,6 +12,12 @@ import {
   installWindowObserver,
   readObservations,
 } from "../src/windowObserver.js";
+import {
+  createState,
+  recordFocus,
+  resolveSourceWindowId,
+} from "../src/state.js";
+import { cloneIntoWindow, installWindowCloning } from "../src/windowCloning.js";
 
 const START = 1_700_000_000_000;
 
@@ -65,6 +71,8 @@ async function setup(
     sessionStartedAt = LONG_AGO,
     startedAt = LONG_AGO,
     breakSessionStorage = false,
+    performClone,
+    resolveCloneSource,
   } = {},
 ) {
   const fake = createFakeChrome({
@@ -94,6 +102,8 @@ async function setup(
   const observer = installWindowObserver(fake.api, {
     now: clock.now,
     wait: clock.wait,
+    performClone,
+    resolveCloneSource,
   });
   return { ...fake, clock, observer, logs };
 }
@@ -659,4 +669,243 @@ test("the console summary says why a storm looks like a storm", async (t) => {
 test("readObservations reads an empty store as no records", async () => {
   const { api } = createFakeChrome();
   assert.deepEqual(await readObservations(api), []);
+});
+
+// ---------------------------------------------------------------------------
+// Driving the cloner
+//
+// Production wires `performClone` and `resolveCloneSource`; observe-only (the
+// kill switch off) leaves them undefined and the observer only logs. These pin
+// the handoff: the classifier decides, and only a "would clone" verdict reaches
+// the writer, with the source captured at create time.
+// ---------------------------------------------------------------------------
+
+/** A spy standing in for cloneIntoWindow. Records (windowId, sourceId). */
+function cloneSpy(result = true) {
+  const calls = [];
+  const fn = async (win, sourceId) => {
+    calls.push({ windowId: win.id, sourceId });
+    return result;
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+test("a would-clone verdict hands the window to the cloner and records it", async (t) => {
+  const performClone = cloneSpy(true);
+  const fake = await setup(t, { performClone, resolveCloneSource: () => 1 });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  assert.deepEqual(performClone.calls, [{ windowId: 2, sourceId: 1 }]);
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.wouldClone, true, record.reasons?.join(" "));
+  assert.equal(record.action, "cloned");
+});
+
+test("a window the classifier rejects is never handed to the cloner", async (t) => {
+  const performClone = cloneSpy(true);
+  const fake = await setup(t, { performClone, resolveCloneSource: () => 1 });
+  // Never focused: a mid-session Space, which the classifier vetoes.
+  await observeWindow(fake, openBlankWindow(fake, 2, { focused: false }), {
+    focus: false,
+  });
+
+  assert.deepEqual(performClone.calls, []);
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.wouldClone, false);
+  assert.equal(record.action, "logged");
+});
+
+test("a clone the writer declines is recorded as declined", async (t) => {
+  const performClone = cloneSpy(false);
+  const fake = await setup(t, { performClone, resolveCloneSource: () => 1 });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  assert.equal(performClone.calls.length, 1);
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.action, "clone-declined-by-writer");
+});
+
+test("a clone action that throws does not break the observer", async (t) => {
+  const performClone = async () => {
+    throw new Error("boom");
+  };
+  const fake = await setup(t, { performClone, resolveCloneSource: () => 1 });
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.action, "clone-errored");
+  assert.equal(record.wouldClone, true);
+});
+
+test("the clone source is captured at create time, not after the focus grace", async (t) => {
+  const performClone = cloneSpy(true);
+  let source = 1;
+  const fake = await setup(t, {
+    performClone,
+    resolveCloneSource: () => source,
+  });
+  void fake.api.windows.onCreated.emit(openBlankWindow(fake, 2));
+  // The focus history moves during the grace period. The source handed to the
+  // writer must be the one from create time, not this later value.
+  source = 999;
+  fake.clock.advance(30);
+  void fake.api.windows.onFocusChanged.emit(2);
+  fake.clock.advance(FOCUS_GRACE_MS + 1);
+  await fake.observer.idle();
+
+  assert.deepEqual(performClone.calls, [{ windowId: 2, sourceId: 1 }]);
+});
+
+test("a restart storm hands nothing to the cloner", async (t) => {
+  const performClone = cloneSpy(true);
+  // Fresh session marker: every window is inside the quiet period, and they
+  // arrive in a burst. Storm windows DO focus fast, so focus alone would not
+  // save us here — the quiet period and burst counter must.
+  const fake = await setup(t, {
+    sessionStartedAt: START,
+    performClone,
+    resolveCloneSource: () => 1,
+  });
+  for (let id = 2; id <= 8; id += 1) {
+    void fake.api.windows.onCreated.emit(openBlankWindow(fake, id));
+    fake.clock.advance(5);
+    void fake.api.windows.onFocusChanged.emit(id);
+  }
+  fake.clock.advance(FOCUS_GRACE_MS + 1);
+  await fake.observer.idle();
+
+  assert.deepEqual(performClone.calls, [], "no restored Space may be cloned");
+  const log = await readObservations(fake.api);
+  assert.ok(log.every((r) => r.wouldClone === false));
+  assert.ok(log.every((r) => r.action === "logged"));
+});
+
+test("with no clone action wired, the observer only logs", async (t) => {
+  const fake = await setup(t);
+  await observeWindow(fake, openBlankWindow(fake, 2));
+
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.wouldClone, true);
+  assert.equal(record.action, "logged");
+});
+
+// ---------------------------------------------------------------------------
+// End to end with the real cloner
+//
+// The spy tests pin the handoff; cloneIntoWindow's internals are pinned by
+// test/windowCloning.test.js. This proves the two compose: a genuine Cmd+N,
+// driven only through the observer, actually copies the source window's tabs.
+// ---------------------------------------------------------------------------
+
+test("a genuine Cmd+N, driven through the observer, really clones the source", async (t) => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://a.test/" },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+    ],
+  });
+  fake.storage.set("meta", { browserStartedAt: LONG_AGO });
+  fake.session.set(SESSION_START_KEY, LONG_AGO);
+
+  const state = createState();
+  recordFocus(state, 1); // the window the user came from
+  installWindowCloning(fake.api, state); // abort tracking
+
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args);
+  t.after(() => {
+    console.log = originalLog;
+  });
+
+  const clock = createManualClock(START);
+  const observer = installWindowObserver(fake.api, {
+    now: clock.now,
+    wait: clock.wait,
+    resolveCloneSource: (win) => resolveSourceWindowId(state, win.id),
+    performClone: (win, sourceId) =>
+      cloneIntoWindow(fake.api, state, win, sourceId),
+  });
+
+  // A blank new window, focused fast: a deliberate Cmd+N.
+  const win = { id: 2, type: "normal", incognito: false, focused: true };
+  fake.windows.set(2, win);
+  fake.tabs.set(20, {
+    id: 20,
+    windowId: 2,
+    index: 0,
+    url: "about:blank",
+    pinned: false,
+    active: true,
+    groupId: -1,
+    mutedInfo: { muted: false },
+  });
+
+  void fake.api.windows.onCreated.emit(win);
+  clock.advance(30);
+  void fake.api.windows.onFocusChanged.emit(2);
+  clock.advance(FOCUS_GRACE_MS + 1);
+  await observer.idle();
+
+  const clonedUrls = [...fake.tabs.values()]
+    .filter((tab) => tab.windowId === 2)
+    .sort((a, b) => a.index - b.index)
+    .map((tab) => tab.url);
+  assert.deepEqual(clonedUrls, ["https://a.test/", "https://b.test/"]);
+});
+
+test("a window created during a restore is never cloned, even with a clone wired", async (t) => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [{ id: 10, windowId: 1, index: 0, url: "https://a.test/", active: true }],
+  });
+  fake.storage.set("meta", { browserStartedAt: LONG_AGO });
+  fake.session.set(SESSION_START_KEY, LONG_AGO);
+
+  const state = createState();
+  recordFocus(state, 1);
+  installWindowCloning(fake.api, state);
+  state.restoreInProgress = true; // a restore is building windows
+
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args);
+  t.after(() => {
+    console.log = originalLog;
+  });
+
+  const clock = createManualClock(START);
+  const observer = installWindowObserver(fake.api, {
+    now: clock.now,
+    wait: clock.wait,
+    resolveCloneSource: (win) => resolveSourceWindowId(state, win.id),
+    performClone: (win, sourceId) =>
+      cloneIntoWindow(fake.api, state, win, sourceId),
+  });
+
+  const win = { id: 2, type: "normal", incognito: false, focused: true };
+  fake.windows.set(2, win);
+  fake.tabs.set(20, {
+    id: 20,
+    windowId: 2,
+    index: 0,
+    url: "about:blank",
+    pinned: false,
+    active: true,
+    groupId: -1,
+    mutedInfo: { muted: false },
+  });
+
+  void fake.api.windows.onCreated.emit(win);
+  clock.advance(30);
+  void fake.api.windows.onFocusChanged.emit(2);
+  clock.advance(FOCUS_GRACE_MS + 1);
+  await observer.idle();
+
+  const win2Tabs = [...fake.tabs.values()].filter((tab) => tab.windowId === 2);
+  assert.equal(win2Tabs.length, 1, "the restored window must be left untouched");
+  const [record] = await readObservations(fake.api);
+  assert.equal(record.action, "clone-declined-by-writer");
 });
