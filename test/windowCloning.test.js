@@ -1064,3 +1064,17 @@ test("writeIntoNewWindow does not remove the placeholder when the window aborted
     "no tab may be removed once the window is known gone",
   );
 });
+
+test("writeIntoNewWindow writes nothing when buildPlan returns null", async () => {
+  // buildPlan returning null means the read was abandoned (e.g. the target
+  // aborted). The window is created but no tab is written and it returns true.
+  const fake = createFakeChrome({ windows: [{ id: 1 }], tabs: [] });
+  const state = createState();
+  const created = await writeIntoNewWindow(fake.api, state, () => null);
+  assert.equal(created, true);
+  assert.equal(
+    fake.calls.some(([name]) => name === "tabs.create"),
+    false,
+    "no tab may be created when there is no plan",
+  );
+});
