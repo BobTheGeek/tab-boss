@@ -1,4 +1,5 @@
 import { findTabset, upsertTabset } from "./tabsetStore.js";
+import { validateName } from "./popupModel.js";
 import { planFromWindow, writeIntoNewWindow } from "./windowCloning.js";
 import { restoreNewest } from "./restore.js";
 import { CAPTURE, OPEN, RESTORE } from "./popupMessages.js";
@@ -34,6 +35,13 @@ export async function handlePopupMessage(api, state, message, now) {
 }
 
 async function captureCurrentWindow(api, name, now) {
+  // The worker is the trust boundary: the popup validates too, but a buggy or
+  // crafted message could arrive with an empty or oversized name. Validate with
+  // the same rule the popup uses, so the two cannot drift, and store the
+  // trimmed form.
+  const check = validateName(name);
+  if (!check.valid) return { ok: false, reason: "bad-name" };
+
   let source;
   try {
     source = await api.windows.getLastFocused();
@@ -46,7 +54,7 @@ async function captureCurrentWindow(api, name, now) {
   const described = await planFromWindow(api, source.id, NEVER_ABORTS);
   if (described === null) return { ok: false, reason: "read-failed" };
   const overwritten = await upsertTabset(api, {
-    name,
+    name: check.name,
     savedAt: now(),
     plan: described.plan,
     groups: described.groups,
@@ -57,9 +65,9 @@ async function captureCurrentWindow(api, name, now) {
 async function openTabset(api, state, name) {
   const set = await findTabset(api, name);
   if (set === null) return { ok: false, reason: "not-found" };
-  await writeIntoNewWindow(api, state, () => ({
+  const created = await writeIntoNewWindow(api, state, () => ({
     plan: set.plan,
     groups: set.groups,
   }));
-  return { ok: true, created: 1 };
+  return created ? { ok: true, created: 1 } : { ok: false, reason: "create-failed" };
 }

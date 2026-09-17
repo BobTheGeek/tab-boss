@@ -110,3 +110,34 @@ test("an unknown or malformed message is rejected", async () => {
     false,
   );
 });
+
+test("capture rejects an empty or garbage name at the worker boundary", async () => {
+  const fake = focusedWindow();
+  for (const name of ["", "   ", null, "x".repeat(61)]) {
+    const reply = await handlePopupMessage(fake.api, createState(), { type: CAPTURE, name }, now);
+    assert.equal(reply.ok, false, `name ${JSON.stringify(name)} must be rejected`);
+  }
+  assert.deepEqual(await readTabsets(fake.api), [], "nothing may be stored");
+});
+
+test("capture stores the trimmed name", async () => {
+  const fake = focusedWindow();
+  await handlePopupMessage(fake.api, createState(), { type: CAPTURE, name: "  Trimmed  " }, now);
+  const [set] = await readTabsets(fake.api);
+  assert.equal(set.name, "Trimmed");
+});
+
+test("open reports failure when the window cannot be created", async () => {
+  const fake = focusedWindow();
+  await upsertTabset(fake.api, {
+    name: "W",
+    savedAt: 1,
+    plan: [{ url: "https://x.test/", pinned: false, muted: false, active: true, groupKey: null }],
+    groups: [],
+  });
+  fake.api.windows.create = async () => {
+    throw new Error("no window");
+  };
+  const reply = await handlePopupMessage(fake.api, createState(), { type: OPEN, name: "W" }, now);
+  assert.equal(reply.ok, false);
+});
