@@ -27,7 +27,7 @@ import { installWindowObserver } from "./windowObserver.js";
  * observe-only: it classifies and logs, and writes nothing. It remains the one
  * lever that disables all tab writing.
  */
-const TAB_WRITING_ENABLED = true;
+const TAB_WRITING_ENABLED = false;
 
 const state = createState();
 

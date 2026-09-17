@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Tab Boss",
-  "version": "1.2.0",
-  "description": "New tabs go to the bottom. New windows clone the window you came from. Your layout is backed up.",
+  "name": "Tab Boss (cloning OFF)",
+  "version": "1.2.1",
+  "description": "New tabs to the bottom. Snapshots on. Auto-clone DISABLED: a new ego lite Space is indistinguishable from Cmd+N (tb-l56).",
   "permissions": [
     "tabs",
     "tabGroups",
