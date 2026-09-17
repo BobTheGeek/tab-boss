@@ -1,16 +1,26 @@
 {
   "manifest_version": 3,
-  "name": "Tab Boss (watching only)",
-  "version": "1.1.3",
-  "description": "New tabs go to the bottom. Tab writing OFF. Logging what it would have cloned, to settle tb-l56.",
+  "name": "Tab Boss",
+  "version": "1.3.0",
+  "description": "New tabs to the bottom. Duplicate the current window on demand. Automatic tab-layout snapshots. Auto-clone-on-new-window is disabled: on ego lite a new Space is indistinguishable from Cmd+N.",
   "permissions": [
     "tabs",
     "tabGroups",
     "storage",
-    "alarms"
+    "alarms",
+    "contextMenus"
   ],
   "action": {
     "default_title": "Tab Boss — restore the newest tab layout"
+  },
+  "commands": {
+    "duplicate-window": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Duplicate this window"
+    }
   },
   "background": {
     "service_worker": "src/background.js",

@@ -52,7 +52,7 @@ export const MAX_RECORDED_TAB_URLS = 5;
 const LOG_PREFIX = "[Tab Boss dx]";
 
 /** Bumped if the record shape changes, so an old log is not misread. */
-const RECORD_VERSION = 1;
+const RECORD_VERSION = 2;
 
 export async function readObservations(api) {
   try {
@@ -220,6 +220,16 @@ export function installWindowObserver(api, options = {}) {
   api.windows.onCreated.addListener((win) => {
     const createdAt = now();
 
+    // Captured synchronously, at the create event, because the clone source is
+    // read from the focus history and that history moves as the user clicks
+    // around during the focus-grace wait below. Resolving it later would clone
+    // whatever window the user glanced at instead of the one they came from.
+    // Cheap and pure, so it is computed for every window and only used if the
+    // verdict later comes back "clone".
+    const cloneSource = options.resolveCloneSource
+      ? options.resolveCloneSource(win)
+      : null;
+
     // Everything up to the first await runs synchronously, so a storm of
     // events cannot interleave and miscount itself.
     recentCreations = recentCreations.filter(
@@ -255,6 +265,7 @@ export function installWindowObserver(api, options = {}) {
       msSincePreviousWindow,
       pending,
       grace,
+      cloneSource,
     })
       .catch(() => {
         // An instrument that throws into the browser's event loop is worse
@@ -268,7 +279,10 @@ export function installWindowObserver(api, options = {}) {
     return task;
   });
 
-  async function observe(win, { createdAt, burst, msSincePreviousWindow, pending, grace }) {
+  async function observe(
+    win,
+    { createdAt, burst, msSincePreviousWindow, pending, grace, cloneSource },
+  ) {
     let tabs = null;
     try {
       tabs = await api.tabs.query({ windowId: win.id });
@@ -314,8 +328,18 @@ export function installWindowObserver(api, options = {}) {
           : tabs
               .slice(0, MAX_RECORDED_TAB_URLS)
               .map((tab) => ({ url: tab.url || tab.pendingUrl || "" })),
+      // Clamped at 0. The session marker is claimed without awaiting at
+      // install, so the first window of a restart can have its createdAt
+      // stamped a millisecond or two BEFORE the marker is written, yielding a
+      // small negative elapsed (seen live as msSinceSessionStart: -1). A
+      // negative is nonsense, and 0 is the correct reading anyway: a window at
+      // the very start of the session is inside the quiet period. Clamping
+      // keeps the classifier's "too soon" veto firing rather than feeding it a
+      // value it would have to reason about.
       msSinceSessionStart:
-        sessionStartedAt === null ? null : createdAt - sessionStartedAt,
+        sessionStartedAt === null
+          ? null
+          : Math.max(0, createdAt - sessionStartedAt),
       windowsCreatedInLastTwoSeconds: burst,
       becameFocusedWithinMs:
         pending.focusedAt === null ? null : pending.focusedAt - createdAt,
@@ -323,8 +347,30 @@ export function installWindowObserver(api, options = {}) {
 
     const { wouldClone, reasons } = classifyWindow(observation);
 
+    // When a clone action is wired (production, kill switch on) and the verdict
+    // is a deliberate Cmd+N, hand the window to the cloner. The cloner runs its
+    // OWN independent gate on top of this — it re-queries the window, re-checks
+    // one-blank-tab, validates the source, probes liveness, and keeps every
+    // tb-084 abort guard. So this is a second gate in front of that one, not a
+    // replacement for it. `action` records what actually happened downstream,
+    // so the log is a black box if cloning ever misbehaves again.
+    //
+    // performClone must never throw; it wraps its own failures. The guard here
+    // is belt to that braces: an instrument that throws into the event loop is
+    // worse than one that mislabels a record.
+    let action = "logged";
+    if (wouldClone && options.performClone) {
+      try {
+        const cloned = await options.performClone(win, cloneSource);
+        action = cloned ? "cloned" : "clone-declined-by-writer";
+      } catch {
+        action = "clone-errored";
+      }
+    }
+
     const record = {
       version: RECORD_VERSION,
+      action,
       // Wall clock first, so scanning the log reads as a timeline rather than
       // as a column of epoch milliseconds.
       at: new Date(createdAt).toISOString(),

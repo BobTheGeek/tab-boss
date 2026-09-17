@@ -103,7 +103,12 @@ async function planFromWindow(api, sourceId, watch) {
  * tab out already holds a real page, a window.open() popup already holds a URL,
  * and a session restore holds many tabs. Only a deliberate Cmd+N passes.
  */
-export async function cloneIntoWindow(api, state, newWindow) {
+export async function cloneIntoWindow(
+  api,
+  state,
+  newWindow,
+  sourceId = resolveSourceWindowId(state, newWindow.id),
+) {
   // Restore creates windows of its own. Both this check and the flag's setter
   // are synchronous, so no event can interleave between them. This also
   // ignores a genuine Cmd+N for the length of the restore, which is the right
@@ -111,13 +116,23 @@ export async function cloneIntoWindow(api, state, newWindow) {
   // smaller loss than a restored window with a clone dumped on top of it.
   if (state.restoreInProgress) return false;
 
-  // Resolved before the first await. Any windows.onFocusChanged landing while
-  // this function is suspended rewrites the focus history the source is
-  // derived from, so two quick Cmd+N presses would otherwise clone each other.
-  // It is a pure read of state, so computing it for windows that later fail
-  // the gate costs nothing.
-  const sourceId = resolveSourceWindowId(state, newWindow.id);
+  // A window restore created is never a Cmd+N and must never be a clone target.
+  // Unlike restoreInProgress, this holds however late the decision runs: the
+  // observer now decides ~400ms after windows.onCreated, by which time a brief
+  // restore may have finished and cleared its flag, but the tag restore set
+  // when it created the window is still here. This is the fix for the tb-l56
+  // restore-race, where a blank restored window got the user's tabs cloned on.
+  if (state.restoredWindowIds.has(newWindow.id)) return false;
 
+  // `sourceId` must be fixed from the focus history at the moment the window
+  // was created. When the cloner was called synchronously on
+  // windows.onCreated that was automatic, and the default above still does it
+  // for that path. The window observer now drives cloning, and it calls this
+  // AFTER a focus-grace delay by which time onFocusChanged may have moved the
+  // history on — cloning whatever window the user glanced at instead of the
+  // one they came from. So the observer captures the source synchronously at
+  // create time and passes it in. Either way it is fixed before the first
+  // await below, so two quick Cmd+N presses cannot clone each other.
   if (newWindow.incognito) return false;
   if (newWindow.type !== "normal") return false;
 
@@ -209,16 +224,93 @@ export async function cloneIntoWindow(api, state, newWindow) {
   }
 }
 
-export function installWindowCloning(api, state) {
-  // Manifest V3 will not wake an evicted service worker for a listener that
-  // was registered inside an awaited callback, so both registrations stay
-  // synchronous at the top level of the installer.
-  api.windows.onCreated.addListener(
-    async (win) => {
-      await cloneIntoWindow(api, state, win);
-    },
-    { windowTypes: ["normal"] },
-  );
+/**
+ * Explicitly duplicates the user's current window into a brand new one.
+ *
+ * This is the user-triggered replacement for auto-clone-on-new-window, which
+ * cannot work on ego lite: creating a Space is indistinguishable from Cmd+N, so
+ * no windows.onCreated handler can safely decide to clone (tb-l56). Here the
+ * user asks for it by name, so there is nothing to detect and no storm to fear.
+ *
+ * The source is whatever window has focus when the command fires, captured
+ * BEFORE the new window is created (windows.create steals focus). It reuses the
+ * same crash-hardened write path as the cloner: an abort watch checked before
+ * every call, the new window tagged so nothing else ever writes to it, and the
+ * placeholder left in place if nothing could be copied.
+ *
+ * Returns true when a window was created, false when there was nothing to copy.
+ */
+export async function duplicateFocusedWindow(api, state) {
+  let source;
+  try {
+    source = await api.windows.getLastFocused();
+  } catch {
+    // No open window to copy.
+    return false;
+  }
+  if (!source || source.type !== "normal" || source.incognito) return false;
 
+  let target;
+  try {
+    target = await api.windows.create({});
+  } catch (error) {
+    console.warn("[Tab Boss] duplicate failed", error);
+    return false;
+  }
+
+  // Tagged the instant it exists and, like restore, NOT cleared when this
+  // finishes: nothing may ever clone onto a window Tab Boss itself created.
+  // Cleared only when the window closes (windows.onRemoved). suppressedWindowIds
+  // keeps new tab placement off it while it fills.
+  state.suppressedWindowIds.add(target.id);
+  state.restoredWindowIds.add(target.id);
+  const watch = createAbortWatch(state, target.id);
+  try {
+    const placeholders = await api.tabs.query({ windowId: target.id });
+    const described = await planFromWindow(api, source.id, watch);
+    if (watch.aborted() || described === null) return true;
+    const written = await writeTabs(
+      api,
+      watch,
+      target.id,
+      described.plan,
+      described.groups,
+    );
+    // The placeholder belongs to a window that has gone; nothing safe to call.
+    if (watch.aborted()) return true;
+    // Removing a window's last tab closes it. If the source held only
+    // unclonable tabs, leave the new window with its blank tab rather than
+    // making it vanish.
+    if (written.length > 0 && placeholders.length === 1) {
+      await api.tabs.remove(placeholders[0].id);
+    }
+    return true;
+  } catch (error) {
+    // The user can close the new window mid-copy. That is an expected race and
+    // stays silent; anything else must be findable.
+    if (!watch.aborted() && (await windowStillOpen(api, target.id))) {
+      console.warn("[Tab Boss] duplicate failed", error);
+    }
+    return true;
+  } finally {
+    state.suppressedWindowIds.delete(target.id);
+    state.abortedWindowIds.delete(target.id);
+  }
+}
+
+/**
+ * The window observer is now the single windows.onCreated handler. It
+ * classifies every new window and, only when the verdict is a deliberate
+ * Cmd+N, calls `cloneIntoWindow` itself. The cloner deliberately no longer
+ * registers its own onCreated listener: two independent listeners for one
+ * event, each with its own idea of what a "new window" is, is exactly the
+ * drift that let restored ego lite Spaces get cloned into (tb-l56).
+ *
+ * What remains here is the abort tracking — the windows.onRemoved listener
+ * that arms the per-window abort watch. It is load-bearing for BOTH cloning
+ * and restore, so it is installed unconditionally, independent of the kill
+ * switch, wherever this is called.
+ */
+export function installWindowCloning(api, state) {
   installAbortTracking(api, state);
 }

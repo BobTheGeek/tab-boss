@@ -5,6 +5,7 @@ import { createState, recordFocus } from "../src/state.js";
 import { isClonableUrl as writerIsClonableUrl } from "../src/tabWriter.js";
 import {
   cloneIntoWindow,
+  duplicateFocusedWindow,
   installWindowCloning,
   isBlankTab,
   isClonableUrl,
@@ -73,6 +74,19 @@ test("the cloner ignores a window while a restore is running", async () => {
   const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
   assert.equal(cloned, false);
   assert.deepEqual(fake.calls, [], "it must not even look at the window");
+});
+
+test("a window restore created is never cloned, even after the restore ended", async () => {
+  // The tb-l56 restore-race: cloning is decided ~400ms after onCreated, so a
+  // brief restore can finish and clear restoreInProgress before the decision
+  // runs. The tag restore left on the window must still veto the clone, even
+  // though the window now looks exactly like a deliberate Cmd+N.
+  const { fake, state } = setupClonable();
+  state.restoreInProgress = false; // the restore has already finished
+  state.restoredWindowIds.add(2); // but it created window 2
+  const cloned = await cloneIntoWindow(fake.api, state, fake.windows.get(2));
+  assert.equal(cloned, false);
+  assert.deepEqual(fake.calls, [], "a restored window is never a clone target");
 });
 
 test("a window holding a real page is not cloned into", async () => {
@@ -498,6 +512,15 @@ test("closing a window no clone is filling records nothing", async () => {
   assert.equal(state.abortedWindowIds.size, 0);
 });
 
+test("closing a restored window forgets its clone-target veto", async () => {
+  // restoredWindowIds must be cleared when the window closes, or it grows for
+  // the life of the worker across a long session of restores.
+  const { fake, state } = setupThreeTabSource(); // installs abort tracking
+  state.restoredWindowIds.add(2);
+  await fake.api.windows.onRemoved.emit(2);
+  assert.equal(state.restoredWindowIds.has(2), false);
+});
+
 // --- The close lands during the gate, before the clone starts ---------------
 //
 // The gate awaits twice before the first tab is created, and a reflexive close
@@ -879,4 +902,102 @@ test("a window removed during the source read is never written into", async () =
   );
   assert.deepEqual(callsAfter(fake, cut), []);
   assert.equal(cloned, false);
+});
+
+// ---------------------------------------------------------------------------
+// Duplicate this window (explicit, user-triggered)
+//
+// The safe replacement for auto-clone: the user asks by name, so there is no
+// windows.onCreated to misread and no restart storm to fear. It reuses the same
+// write path and every guard.
+// ---------------------------------------------------------------------------
+
+function newWindowIds(fake, before) {
+  return [...fake.windows.keys()].filter((id) => !before.has(id));
+}
+
+test("duplicate copies the focused window's tabs into a brand new window", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [
+      { id: 10, windowId: 1, index: 0, url: "https://a.test/" },
+      { id: 11, windowId: 1, index: 1, url: "https://b.test/", active: true },
+    ],
+  });
+  const state = createState();
+  const before = new Set(fake.windows.keys());
+
+  const ok = await duplicateFocusedWindow(fake.api, state);
+  assert.equal(ok, true);
+
+  const [newId] = newWindowIds(fake, before);
+  const urls = [...fake.tabs.values()]
+    .filter((t) => t.windowId === newId)
+    .sort((a, b) => a.index - b.index)
+    .map((t) => t.url);
+  assert.deepEqual(urls, ["https://a.test/", "https://b.test/"]);
+  // The original window is left exactly as it was.
+  assert.equal([...fake.tabs.values()].filter((t) => t.windowId === 1).length, 2);
+});
+
+test("duplicate never touches an existing window", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [{ id: 10, windowId: 1, index: 0, url: "https://a.test/", active: true }],
+  });
+  const state = createState();
+  await duplicateFocusedWindow(fake.api, state);
+  const removes = fake.calls.filter(([name]) => name === "tabs.remove");
+  // The only remove allowed is the new window's own placeholder.
+  for (const [, tabId] of removes) {
+    assert.notEqual(tabId, 10, "an existing window's tab was removed");
+  }
+});
+
+test("duplicate tags the new window so nothing else can clone onto it", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [{ id: 10, windowId: 1, index: 0, url: "https://a.test/", active: true }],
+  });
+  const state = createState();
+  const before = new Set(fake.windows.keys());
+  await duplicateFocusedWindow(fake.api, state);
+  const [newId] = newWindowIds(fake, before);
+  assert.ok(state.restoredWindowIds.has(newId), "the new window must be tagged");
+});
+
+test("duplicate does nothing when the focused window is incognito", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1, incognito: true }],
+    tabs: [{ id: 10, windowId: 1, index: 0, url: "https://a.test/", active: true }],
+  });
+  const state = createState();
+  const before = new Set(fake.windows.keys());
+  const ok = await duplicateFocusedWindow(fake.api, state);
+  assert.equal(ok, false);
+  assert.deepEqual(newWindowIds(fake, before), [], "no window may be created");
+});
+
+test("duplicate does nothing when there is no window to copy", async () => {
+  const fake = createFakeChrome();
+  const state = createState();
+  const ok = await duplicateFocusedWindow(fake.api, state);
+  assert.equal(ok, false);
+});
+
+test("an all-unclonable source leaves the new window with its blank tab", async () => {
+  const fake = createFakeChrome({
+    windows: [{ id: 1 }],
+    tabs: [{ id: 10, windowId: 1, index: 0, url: "chrome://settings/", active: true }],
+  });
+  const state = createState();
+  const before = new Set(fake.windows.keys());
+  const ok = await duplicateFocusedWindow(fake.api, state);
+  assert.equal(ok, true);
+  const [newId] = newWindowIds(fake, before);
+  assert.equal(
+    [...fake.tabs.values()].filter((t) => t.windowId === newId).length,
+    1,
+    "the new window must not vanish",
+  );
 });
