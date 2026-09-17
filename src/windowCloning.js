@@ -1,38 +1,9 @@
-import {
-  TAB_GROUP_ID_NONE,
-  createAbortWatch,
-  installAbortTracking,
-  resolveSourceWindowId,
-} from "./state.js";
+import { TAB_GROUP_ID_NONE, createAbortWatch } from "./state.js";
 import { windowStillOpen, writeTabs } from "./tabWriter.js";
 
 // The scheme test lives with the writer that applies it, and is re-exported
-// here so existing importers of windowCloning keep working.
+// here so importers of windowCloning keep working.
 export { isClonableUrl } from "./tabWriter.js";
-
-/** Exact URLs a brand new empty window may show. */
-export const BLANK_TAB_URLS = ["", "about:blank"];
-
-/**
- * Prefixes of new-tab-page URLs. ego lite is Chromium based, so it may use any
- * of these. If a future build uses something else, add it here — this list is
- * the single place blankness is decided.
- */
-export const BLANK_TAB_PREFIXES = [
-  "chrome://newtab",
-  "chrome://new-tab-page",
-  "ego://newtab",
-];
-
-export function isBlankTab(tab) {
-  const url = tab.url || tab.pendingUrl || "";
-  if (BLANK_TAB_URLS.includes(url)) return true;
-  return BLANK_TAB_PREFIXES.some((prefix) => url.startsWith(prefix));
-}
-
-function isCloneSource(win) {
-  return win.type === "normal" && !win.incognito;
-}
 
 /**
  * Reads the source window and describes it as a plan the writer can replay.
@@ -83,7 +54,7 @@ export async function planFromWindow(api, sourceId, watch) {
 
   const plan = sourceTabs.map((tab) => ({
     // A tab whose navigation has not committed reports an empty url and
-    // carries its destination in pendingUrl, exactly as isBlankTab assumes.
+    // carries its destination in pendingUrl.
     url: tab.url || tab.pendingUrl || "",
     pinned: tab.pinned,
     muted: Boolean(tab.mutedInfo?.muted),
@@ -94,134 +65,6 @@ export async function planFromWindow(api, sourceId, watch) {
   }));
 
   return { plan, groups };
-}
-
-/**
- * Requirement 2. Returns true when a clone actually ran.
- *
- * The one-blank-tab check is what makes this safe: a window made by dragging a
- * tab out already holds a real page, a window.open() popup already holds a URL,
- * and a session restore holds many tabs. Only a deliberate Cmd+N passes.
- */
-export async function cloneIntoWindow(
-  api,
-  state,
-  newWindow,
-  sourceId = resolveSourceWindowId(state, newWindow.id),
-) {
-  // Restore creates windows of its own. Both this check and the flag's setter
-  // are synchronous, so no event can interleave between them. This also
-  // ignores a genuine Cmd+N for the length of the restore, which is the right
-  // trade: a restore is brief, and one window that did not clone is a far
-  // smaller loss than a restored window with a clone dumped on top of it.
-  if (state.restoreInProgress) return false;
-
-  // A window restore created is never a Cmd+N and must never be a clone target.
-  // Unlike restoreInProgress, this holds however late the decision runs: the
-  // observer now decides ~400ms after windows.onCreated, by which time a brief
-  // restore may have finished and cleared its flag, but the tag restore set
-  // when it created the window is still here. This is the fix for the tb-l56
-  // restore-race, where a blank restored window got the user's tabs cloned on.
-  if (state.restoredWindowIds.has(newWindow.id)) return false;
-
-  // `sourceId` must be fixed from the focus history at the moment the window
-  // was created. When the cloner was called synchronously on
-  // windows.onCreated that was automatic, and the default above still does it
-  // for that path. The window observer now drives cloning, and it calls this
-  // AFTER a focus-grace delay by which time onFocusChanged may have moved the
-  // history on — cloning whatever window the user glanced at instead of the
-  // one they came from. So the observer captures the source synchronously at
-  // create time and passes it in. Either way it is fixed before the first
-  // await below, so two quick Cmd+N presses cannot clone each other.
-  if (newWindow.incognito) return false;
-  if (newWindow.type !== "normal") return false;
-
-  // Armed before the first await, because windows.onRemoved only records a
-  // window that is already an in-flight clone target. Arming any later would
-  // drop a close that lands during the gate — the likeliest moment of all for
-  // a reflexive Cmd+N, Cmd+W — and leave every guard below reading false.
-  // The cost is that new tab placement skips this window's first tab, which is
-  // a no-op: it is the only tab in a one-tab window.
-  state.suppressedWindowIds.add(newWindow.id);
-  const watch = createAbortWatch(state, newWindow.id);
-  try {
-    let newTabs;
-    try {
-      newTabs = await api.tabs.query({ windowId: newWindow.id });
-    } catch (error) {
-      // The window can be closed before the service worker is even scheduled
-      // to run this, which rejects the gate's very first call. Left alone that
-      // escapes into the listener as an unhandled rejection: noise on an
-      // expected race. Silent if the window has gone, findable if it has not.
-      // The watch is consulted first because a window whose removal has been
-      // announced can still answer a query for a moment, and the probe would
-      // call that routine close a failure.
-      if (!watch.aborted() && (await windowStillOpen(api, newWindow.id))) {
-        console.warn("[Tab Boss] clone failed", error);
-      }
-      return false;
-    }
-    if (newTabs.length !== 1) return false;
-    if (!isBlankTab(newTabs[0])) return false;
-    const placeholder = newTabs[0];
-
-    if (sourceId == null || sourceId === newWindow.id) return false;
-    // A window still being filled by the cloner holds no meaningful contents
-    // yet, so cloning it would copy a half-built window. The line above has
-    // already ruled out this window's own entry.
-    if (state.suppressedWindowIds.has(sourceId)) return false;
-
-    let source;
-    try {
-      source = await api.windows.get(sourceId);
-    } catch {
-      return false;
-    }
-    if (!isCloneSource(source)) return false;
-
-    // The watch cannot see a close that landed before it was armed, and an
-    // event can always be slower than we are. One read-only probe, here,
-    // before the first mutating call, is the belt to that braces.
-    if (!(await windowStillOpen(api, newWindow.id))) {
-      watch.mark();
-      return false;
-    }
-
-    try {
-      const described = await planFromWindow(api, source.id, watch);
-      if (watch.aborted() || described === null) return false;
-      const written = await writeTabs(
-        api,
-        watch,
-        newWindow.id,
-        described.plan,
-        described.groups,
-      );
-      // The placeholder belongs to a window that no longer exists, so there is
-      // nothing to tidy up and nothing safe to call.
-      if (watch.aborted()) return false;
-      // Removing a window's last tab closes the window. If every source tab
-      // was unclonable there is nothing to replace the placeholder with, so
-      // leave a plain empty window rather than making the new window vanish.
-      if (written.length > 0) {
-        await api.tabs.remove(placeholder.id);
-      }
-    } catch (error) {
-      // The user can close the new window mid-clone, which fails every pending
-      // call. That is an expected race and stays silent. Anything else is a
-      // real failure and must be findable in the service worker console. When
-      // the window's death is already known, we do not ask the browser again.
-      if (!watch.aborted() && (await windowStillOpen(api, newWindow.id))) {
-        console.warn("[Tab Boss] clone failed", error);
-      }
-      return false;
-    }
-    return true;
-  } finally {
-    // Every exit from the gate, including a thrown one, unwinds through here.
-    state.suppressedWindowIds.delete(newWindow.id);
-    state.abortedWindowIds.delete(newWindow.id);
-  }
 }
 
 /**
@@ -304,21 +147,4 @@ export async function duplicateFocusedWindow(api, state) {
   return writeIntoNewWindow(api, state, (watch) =>
     planFromWindow(api, source.id, watch),
   );
-}
-
-/**
- * The window observer is now the single windows.onCreated handler. It
- * classifies every new window and, only when the verdict is a deliberate
- * Cmd+N, calls `cloneIntoWindow` itself. The cloner deliberately no longer
- * registers its own onCreated listener: two independent listeners for one
- * event, each with its own idea of what a "new window" is, is exactly the
- * drift that let restored ego lite Spaces get cloned into (tb-l56).
- *
- * What remains here is the abort tracking — the windows.onRemoved listener
- * that arms the per-window abort watch. It is load-bearing for BOTH cloning
- * and restore, so it is installed unconditionally, independent of the kill
- * switch, wherever this is called.
- */
-export function installWindowCloning(api, state) {
-  installAbortTracking(api, state);
 }
