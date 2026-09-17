@@ -8,27 +8,38 @@ with **Show Tabs Vertically** turned on.
 1. **Every new tab goes to the bottom.** Cmd+T, Cmd+clicked links, and links
    that open themselves in a new tab all land at the end of the strip, never
    beside their parent tab.
-2. **Every empty new window clones the window you came from.** Press Cmd+N and
-   the new window opens with the same tabs, in the same order, with the same
-   pinned tabs, muted tabs, tab groups, and selected tab. Background tabs are
-   left unloaded so a large clone does not stall the browser.
-3. **Your layout is backed up.** Every 2 minutes Tab Boss saves a snapshot of
-   all your normal windows — tab order, pinned tabs, muted tabs, tab groups
-   with their names and colours, and which tab was selected. It keeps the last
-   20, about 40 minutes of history. Click the Tab Boss toolbar icon to restore
-   the newest one into brand new windows. Your existing windows are never
-   touched.
+2. **Duplicate this window, on demand.** A keyboard shortcut (default
+   Cmd/Ctrl+Shift+Y, rebindable at `chrome://extensions/shortcuts`) and a
+   right-click "Duplicate this window" menu item open a new window that is a
+   copy of the one you are in — same tabs, order, pinned tabs, muted tabs,
+   groups, and selected tab, with background tabs left unloaded.
+3. **Saved tabsets.** Click the Tab Boss toolbar icon to open the popup. Save
+   the current window under a name ("Daily Work"), and open a saved set into a
+   new window whenever you want. Saving an existing name asks to replace it;
+   deleting asks to confirm.
+4. **Automatic layout backup.** Every 2 minutes Tab Boss snapshots all your
+   normal windows — tab order, pinned tabs, muted tabs, groups with their names
+   and colours, and the selected tab — keeping the last 20 (about 40 minutes).
+   The popup has a toggle to turn this off, and a **Restore last backup** button
+   that opens the newest snapshot into brand new windows. Your existing windows
+   are never touched.
 
-   Snapshots are skipped in three cases: during the first minute after the
-   browser starts, when the tab count has more than halved since the last one,
-   and when nothing has changed. The first two exist so a crash cannot poison
-   the backup with a post-crash remnant. If you genuinely close half your tabs,
-   the low count is accepted after about six minutes.
+   Snapshots are skipped during the first minute after the browser starts, when
+   the tab count has more than halved since the last one, and when nothing has
+   changed — so a crash cannot poison the backup with a post-crash remnant. A
+   genuine halving is accepted after about six minutes.
 
-   If there is nothing to restore, the toolbar icon shows a `!` for a moment.
+   Everything is stored on this machine only. Nothing is synced. Incognito
+   windows are never captured, duplicated, or restored.
 
-   Snapshots are stored on this machine only. They are never synced and never
-   leave the browser. Incognito windows are never captured or restored.
+### Not enabled: auto-clone on every new window
+
+An earlier version cloned your current window into every newly opened window
+automatically. That cannot work on ego lite: creating a Space is
+indistinguishable from pressing Cmd+N, so it cloned your tabs into every
+restored Space and piled up hundreds of duplicates. It is disabled
+(`TAB_WRITING_ENABLED = false` in `src/background.js`) and replaced by the
+explicit "Duplicate this window" command above.
 
 Dragging a tab out, popup windows opened by a page, incognito windows, and
 session restore on startup are all left alone. This extension requires four
